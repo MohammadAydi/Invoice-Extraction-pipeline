@@ -2,3 +2,5 @@ pydantic>=2.0
 PyYAML>=6.0
 numpy>=1.24
 opencv-python>=4.8
+surya-ocr==0.17.1
+transformers<5.0
