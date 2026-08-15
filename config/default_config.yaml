@@ -1,12 +1,20 @@
 preprocessing:
+  # Available strategies per family -- swap `name:` below to switch:
+  #   deskew:                deskew_hough | deskew_min_area_rect (not implemented, raises NotImplementedStrategyError)
+  #   illumination:           illumination_normalization_blur_divide | illumination_normalization_blackhat (not implemented)
+  #   contrast enhancement:  clahe | plain_equalization
+  #   denoise:                bilateral_filter | median_blur | gaussian_blur | nlm_denoise
+  #   thresholding:           adaptive_threshold | otsu_threshold | fixed_threshold
+  #   morphology:             single step, switch via params.operation: open | close | erode | dilate
+
   # Runs once. Output is the single image shown on both sides of the UI.
   geometric_steps:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
-    - {name: deskew, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10}}
+    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
 
   ocr_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: illumination_normalization, enabled: true, params: {blur_kernel: 95}}
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
     - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
     - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
     - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
