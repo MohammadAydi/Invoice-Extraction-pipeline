@@ -1,0 +1,57 @@
+# config/qwen_config.yaml
+# Integration config: identical to default_config.yaml except for the OCR
+# engine. Preprocessing is deliberately left exactly as it already works, so
+# the only variable being tested here is the surya_qwen engine itself.
+#
+# Tuning preprocessing for the VLM comes later, as a separate change.
+
+preprocessing:
+  geometric_steps:
+    - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
+    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
+
+  ocr_photometric_steps:
+    - {name: channel_selection, enabled: true, params: {channel: gray}}
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
+    - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
+    - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
+    - {name: morphological_cleanup, enabled: true, params: {operation: open, kernel_size: 2}}
+
+  table_photometric_steps:
+    - {name: channel_selection, enabled: true, params: {channel: gray}}
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+
+ocr:
+  engine: surya_qwen
+  engine_params:
+    # "subprocess": the model runs in a second venv that has transformers>=5.0
+    # (this venv pins <5.0 for surya-ocr). No server, no GGUF conversion, and
+    # the model loads once and is reused for every crop.
+    backend: subprocess
+    worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
+    worker_script: "tools/qwen_worker.py"
+    model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+    max_new_tokens: 64
+    kind: any
+    pad: 12
+    upscale: 2
+    # Crops + results.json + results.csv are written here, one folder per run.
+    debug_dir: "det"
+
+table_extraction:
+  extractor: contour_based
+  extractor_params: {}
+
+string_matching:
+  algorithm: levenshtein
+  algorithm_params: {max_distance: 2}
+  dictionary_path: "keywords/ar_invoice_terms.json"
+
+output:
+  formatter: ui_overlay_json
+  formatter_params: {}
+
+persistence:
+  store: file_result_store
+  store_params: {output_dir: "results/"}
