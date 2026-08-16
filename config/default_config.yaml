@@ -21,8 +21,16 @@ ocr:
   engine_params: {lang: ara}
 
 table_extraction:
-  extractor: contour_based
-  extractor_params: {}
+  extractor: grid_line
+  extractor_params:
+    dot_bridge_scale: 150
+    main_kernel_scale: 30
+    min_line_length_ratio: 0.05
+    intersection_tolerance: 15
+    merge_proximity: 15
+    min_extend_length_ratio: 0.5
+    coverage_ratio: 0.5
+    save_debug_images: true
 
 string_matching:
   algorithm: levenshtein
