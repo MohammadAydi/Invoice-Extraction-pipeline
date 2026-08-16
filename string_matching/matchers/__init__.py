@@ -1,1 +1,5 @@
-from string_matching.matchers import levenshtein_matcher, embedding_matcher  # noqa: F401
+from string_matching.matchers import (  # noqa: F401
+    levenshtein_matcher,
+    order_independent_matcher,
+    embedding_matcher,
+)

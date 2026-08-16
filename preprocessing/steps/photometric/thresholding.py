@@ -9,13 +9,15 @@ coexist in the registry without any of them knowing about the others.
 
 from __future__ import annotations
 
+import logging
+
 import cv2
 import numpy as np
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-from matplotlib.figure import Figure
 
 from core.domain.image_payload import PipelineContext
 from preprocessing.steps.registry import step_registry
+
+logger = logging.getLogger(__name__)
 
 
 def _require_single_channel(image, step_name: str) -> None:
@@ -28,7 +30,27 @@ def _require_single_channel(image, step_name: str) -> None:
         )
 
 
-def _histogram_debug_image(gray: np.ndarray) -> np.ndarray:
+def _add_histogram(ctx: PipelineContext, gray: np.ndarray) -> None:
+    """Queue a brightness histogram alongside this step's output image.
+
+    Only when someone is going to look at it. Rendering a matplotlib figure
+    costs more than the thresholding itself, and under the HTTP service -- which
+    runs with debug output off -- every one of them would be drawn and thrown
+    away, once per invoice.
+    """
+    if not ctx.payload.metadata.get("collect_debug_images"):
+        return
+
+    try:
+        # Imported here, not at module scope: matplotlib is a heavyweight
+        # dependency for a diagnostic picture, and the service must start on a
+        # machine that has not installed it.
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+    except ImportError:
+        logger.info("matplotlib is not installed; skipping the threshold histogram.")
+        return
+
     hist = cv2.calcHist([gray], [0], None, [256], [0, 256]).flatten()
     fig = Figure(figsize=(6, 3))
     canvas = FigureCanvasAgg(fig)
@@ -40,7 +62,8 @@ def _histogram_debug_image(gray: np.ndarray) -> np.ndarray:
     fig.tight_layout()
     canvas.draw()
     buf = np.asarray(canvas.buffer_rgba())
-    return cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+
+    ctx.payload.debug_images.append(("histogram", cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)))
 
 
 @step_registry.register("fixed_threshold")
@@ -58,7 +81,7 @@ class FixedThresholdStep:
         _, out = cv2.threshold(gray, self.t, 255, cv2.THRESH_BINARY)
 
         ctx.payload.image = out
-        ctx.payload.debug_images.append(("histogram", _histogram_debug_image(gray)))
+        _add_histogram(ctx, gray)
         return ctx
 
 
@@ -79,7 +102,7 @@ class OtsuThresholdStep:
 
         ctx.payload.image = out
         ctx.payload.metadata["otsu_threshold"] = {"chosen_threshold": otsu_thresh}
-        ctx.payload.debug_images.append(("histogram", _histogram_debug_image(gray)))
+        _add_histogram(ctx, gray)
         return ctx
 
 
@@ -111,5 +134,5 @@ class AdaptiveThresholdStep:
         )
 
         ctx.payload.image = out
-        ctx.payload.debug_images.append(("histogram", _histogram_debug_image(gray)))
+        _add_histogram(ctx, gray)
         return ctx

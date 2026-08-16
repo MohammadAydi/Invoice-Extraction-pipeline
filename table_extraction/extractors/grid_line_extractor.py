@@ -52,17 +52,29 @@ class GridLineTableExtractor:
         self.coverage_ratio = coverage_ratio
         self.save_debug_images = save_debug_images
 
-    def extract(self, image: ImagePayload) -> TableExtractionResult:
-        img = image.image  # numpy BGR array
+    @staticmethod
+    def _to_gray(img):
+        """Single-channel view of the input, whatever the branch handed over.
 
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        The table-photometric branch normally ends in channel_selection and a
+        threshold, so this receives a 1-channel image; but the branch is
+        configurable and may be emptied entirely, in which case the raw BGR page
+        arrives instead. Assuming either one specifically makes the extractor
+        depend on a configuration it does not own.
+        """
+        return img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    def extract(self, image: ImagePayload) -> TableExtractionResult:
+        img = image.image
+
+        gray = self._to_gray(img)
         h, w = gray.shape[:2]
 
         # --- deskew (reuse pipeline's skew estimate) ---
         skew = estimate_skew_angle(gray)
         if abs(skew) > 0.1:
             img = deskew_image(img, skew)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            gray = self._to_gray(img)
             h, w = gray.shape[:2]
 
         binary = cv2.adaptiveThreshold(

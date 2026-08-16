@@ -38,7 +38,11 @@ table_extraction:
     merge_proximity: 15
     min_extend_length_ratio: 0.5
     coverage_ratio: 0.5
-    save_debug_images: true
+    # Off by default. This writes cells_detected.png into the working directory
+    # every time a table is extracted, which under the HTTP service means once
+    # per invoice into whatever folder the desktop app happened to launch from.
+    # Turn it on while tuning the grid parameters from the CLI, not in service.
+    save_debug_images: false
 
 string_matching:
   algorithm: levenshtein

@@ -51,12 +51,9 @@ class HoughDeskewStep:
             minLineLength=self.min_line_length,
             maxLineGap=self.max_line_gap,
         )
-        if lines is None or len(lines) == 0:
-            raise ValueError("No line segments detected for deskew.")
-
         angles = []
         debug_img = image.copy()
-        for line in lines:
+        for line in lines if lines is not None else []:
             x1, y1, x2, y2 = line.reshape(-1)[:4]
             angle = np.degrees(np.arctan2(y2 - y1, x2 - x1))
             if abs(angle) < self.max_angle_deg:
@@ -64,9 +61,17 @@ class HoughDeskewStep:
                 cv2.line(debug_img, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
 
         if not angles:
-            raise ValueError(
-                "No near-horizontal lines found; cannot estimate skew angle."
-            )
+            # Nothing measurable to rotate by. A borderless receipt, or a page of
+            # loose handwriting with no ruled lines, simply has no long straight
+            # edges -- that is a normal invoice, not a failure, and refusing it
+            # here would fail the whole extraction over a step that had nothing
+            # to do. Pass the image through untouched and say so in the metadata.
+            ctx.payload.metadata[self.name] = {
+                "median_angle_deg": 0.0,
+                "num_lines_used": 0,
+                "skipped": "no near-horizontal line segments detected",
+            }
+            return ctx
 
         median_angle = float(np.median(angles))
 

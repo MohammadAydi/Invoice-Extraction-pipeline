@@ -18,12 +18,36 @@ class PreprocessingPipeline:
     def __init__(self, steps: list[PreprocessingStep]):
         self._steps = steps
 
-    def run(self, initial_payload: ImagePayload, debug_dir: Path | None = None) -> ImagePayload:
+    def run(
+        self,
+        initial_payload: ImagePayload,
+        debug_dir: Path | None = None,
+        snapshots: dict | None = None,
+    ) -> ImagePayload:
+        """Run every step in order against one payload.
+
+        `snapshots`, when given, is filled with a copy of the image *before*
+        each step runs, keyed by that step's name, plus `"__final__"` at the
+        end. The HTTP layer uses it to answer "what did the page look like
+        before binarization?" without re-running the pipeline or writing
+        anything to disk -- which is what the `enhanced_image_png` debug image
+        in the API contract is.
+        """
         ctx = PipelineContext(payload=initial_payload)
+
+        # Steps that can produce an extra diagnostic image read this before
+        # building one. Without it, a step like thresholding would render its
+        # histogram on every invoice and the pipeline would immediately discard
+        # it -- which under the HTTP service is the whole cost with none of the
+        # benefit.
+        ctx.payload.metadata["collect_debug_images"] = debug_dir is not None
+
         if debug_dir is not None:
             debug_dir.mkdir(parents=True, exist_ok=True)
             self._save_debug_image(debug_dir, "00_input", ctx.payload.image)
         for idx, step in enumerate(self._steps, start=1):
+            if snapshots is not None:
+                snapshots[step.name] = ctx.payload.image.copy()
             try:
                 ctx = step.apply(ctx)
             except NotImplementedError:
@@ -38,6 +62,8 @@ class PreprocessingPipeline:
                         debug_dir, f"{idx:02d}_{step.name}__{extra_name}", extra_image
                     )
                 ctx.payload.debug_images = []
+        if snapshots is not None:
+            snapshots["__final__"] = ctx.payload.image
         return ctx.payload
 
     @staticmethod

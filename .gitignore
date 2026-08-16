@@ -225,3 +225,10 @@ results/
 det/
 bills/
 data/
+# Pipeline run output: results/ is the per-invoice audit trail, det/ and
+# cells_detected.png are diagnostic dumps from the OCR and table stages.
+results/
+det/
+cells_detected.png
+grid_mask_debug.png
+binary_debug.png
