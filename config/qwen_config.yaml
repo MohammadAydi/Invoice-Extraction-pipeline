@@ -1,13 +1,11 @@
-preprocessing:
-  # Available strategies per family -- swap `name:` below to switch:
-  #   deskew:                deskew_hough | deskew_min_area_rect (not implemented, raises NotImplementedStrategyError)
-  #   illumination:           illumination_normalization_blur_divide | illumination_normalization_blackhat (not implemented)
-  #   contrast enhancement:  clahe | plain_equalization
-  #   denoise:                bilateral_filter | median_blur | gaussian_blur | nlm_denoise
-  #   thresholding:           adaptive_threshold | otsu_threshold | fixed_threshold
-  #   morphology:             single step, switch via params.operation: open | close | erode | dilate
+# config/qwen_config.yaml
+# Integration config: identical to default_config.yaml except for the OCR
+# engine. Preprocessing is deliberately left exactly as it already works, so
+# the only variable being tested here is the surya_qwen engine itself.
+#
+# Tuning preprocessing for the VLM comes later, as a separate change.
 
-  # Runs once. Output is the single image shown on both sides of the UI.
+preprocessing:
   geometric_steps:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
     - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
@@ -25,20 +23,25 @@ preprocessing:
     - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
 
 ocr:
-  engine: tesseract
-  engine_params: {lang: ara}
+  engine: surya_qwen
+  engine_params:
+    # "subprocess": the model runs in a second venv that has transformers>=5.0
+    # (this venv pins <5.0 for surya-ocr). No server, no GGUF conversion, and
+    # the model loads once and is reused for every crop.
+    backend: subprocess
+    worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
+    worker_script: "tools/qwen_worker.py"
+    model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+    max_new_tokens: 64
+    kind: any
+    pad: 12
+    upscale: 2
+    # Crops + results.json + results.csv are written here, one folder per run.
+    debug_dir: "det"
 
 table_extraction:
-  extractor: grid_line
-  extractor_params:
-    dot_bridge_scale: 150
-    main_kernel_scale: 30
-    min_line_length_ratio: 0.05
-    intersection_tolerance: 15
-    merge_proximity: 15
-    min_extend_length_ratio: 0.5
-    coverage_ratio: 0.5
-    save_debug_images: true
+  extractor: contour_based
+  extractor_params: {}
 
 string_matching:
   algorithm: levenshtein
