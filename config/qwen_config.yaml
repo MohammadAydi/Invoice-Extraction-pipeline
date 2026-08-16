@@ -7,16 +7,16 @@
 
 preprocessing:
   geometric_steps:
-    - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
-    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
+    - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}} # قص الصورة وتصحيح المنظور
+    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}} # تصحيح الميلان تبع الفاتورة
 
   ocr_photometric_steps:
-    - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
-    - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
-    - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
-    - {name: morphological_cleanup, enabled: true, params: {operation: open, kernel_size: 2}}
+    - {name: channel_selection, enabled: true, params: {channel: gray}} # اختيار القناة اللونية
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}} # تحسين الاضاءة وتوحيدها
+    - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}} # تحسين التباين
+    - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}} # إزالة الضوضاء
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}} # تحويل الورقة إلى صورة ثنائية (أسود وأبيض)
+    - {name: morphological_cleanup, enabled: true, params: {operation: open, kernel_size: 2}} # تنظيف الصورة باستخدام العمليات المورفولوجية
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
