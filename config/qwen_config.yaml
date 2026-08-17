@@ -1,23 +1,49 @@
-# config/qwen_config.yaml
-# Integration config: identical to default_config.yaml except for the OCR
-# engine. Preprocessing is deliberately left exactly as it already works, so
-# the only variable being tested here is the surya_qwen engine itself.
-#
-# Tuning preprocessing for the VLM comes later, as a separate change.
-
 preprocessing:
+  # Geometric steps are NOT touched: they fix real distortion (a phone photo
+  # taken at an angle) and are the only steps that change coordinates.
   geometric_steps:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
     - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
 
   ocr_photometric_steps:
+    # KEPT (forced): illumination_normalization_blur_divide rejects 3-channel
+    # input, so this must stay on. It is a compromise -- the model calls
+    # .convert("RGB") internally and blue ink on white paper is real signal.
+    # See the note at the bottom for how to recover colour.
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
-    - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
-    - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
-    - {name: morphological_cleanup, enabled: true, params: {operation: open, kernel_size: 2}}
 
+    # KEPT: the single most valuable photometric step. Divides the image by a
+    # blurred estimate of the background, flattening shadows and hotspots --
+    # precisely the "clear, well-lit image / good contrast" the model card asks
+    # for, and what a phone photo most lacks. blur_kernel must exceed pen-stroke
+    # width yet stay small enough to track real lighting change; 95 was
+    # validated on the sample.
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
+
+    # DISABLED: CLAHE lifts the paper background so aggressively that the page
+    # edge merges with the printed table border -- measured to break quad
+    # detection outright. It also amplifies paper grain into false texture.
+    # Illumination normalisation above already solves what CLAHE targets here.
+    - {name: clahe, enabled: false, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
+
+    # DISABLED: smoothing removes the fine stroke detail a VLM relies on. Also
+    # d=20 is far outside the usual d<=5 guidance and is very slow; the value
+    # is left sane here in case it is ever re-enabled for a test.
+    - {name: bilateral_filter, enabled: false, params: {d: 5, sigma_color: 50, sigma_space: 50}}
+
+    # DISABLED: binarisation is the most harmful single step for this model.
+    # It discards stroke thickness, pressure and anti-aliasing -- the cues that
+    # separate a hurried Arabic-Indic 5 from a 6.
+    - {name: adaptive_threshold, enabled: false, params: {block_size: 51, c: 35}}
+
+    # DISABLED: measured worse in three of four variants. Erosion fragments
+    # Arabic letters until the detector sees debris; dilation fuses adjacent
+    # digits into one glyph. Neither failure is recoverable downstream.
+    - {name: morphological_cleanup, enabled: false, params: {operation: open, kernel_size: 2}}
+
+  # UNCHANGED: contour-based table extraction genuinely needs a binary image
+  # with clean edges. This is why separating the two photometric paths was the
+  # right architectural decision -- what helps one branch harms the other.
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
     - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
@@ -32,11 +58,81 @@ ocr:
     worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
     worker_script: "tools/qwen_worker.py"
     model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+
+    # An invoice cell is short. Capping generation low bounds the damage when
+    # the model starts looping on an unreadable crop, and cuts CPU time.
     max_new_tokens: 64
+
+    # Fallback prompt for anything outside the column ranges below: header
+    # text, the invoice number, the totals line.
     kind: any
-    pad: 12
+
+    # 16 not 12: Arabic carries dots and tails past the baseline, and this
+    # handwriting regularly overshoots the ruled line. A clipped tail turns one
+    # letter into another. Over-wide crops cost nothing; clipped ones lose data.
+    pad: 10
+
+    # The model thumbnails its input to a 768px long side. Upscaling first
+    # means a small cell (a two-digit quantity) arrives near that budget rather
+    # than far below it. Larger factors only resample blur.
     upscale: 2
-    # Crops + results.json + results.csv are written here, one folder per run.
+
+    # Per-column prompts -- the highest-value setting in this file. The model
+    # transliterates Arabic-Indic digits into look-alike Latin letters
+    # (5->O, 7->V, 8->A); naming that mapping in the prompt suppresses it.
+    #
+    # `kind` must be a prompt kind (number / arabic_text / any), NOT a column
+    # name. A list, not a dict, because price, quantity and total all map to
+    # "number" and dict keys cannot repeat.
+    #
+    # Ranges are fractions of image width, measured on the sample form AFTER
+    # perspective correction. VERIFY against _page_boxes.png before trusting
+    # them: a shifted boundary sends the digits-only prompt to the description
+    # column, which would be worse than having no column mapping at all.
+    # One entry per PHYSICAL column, not per prompt kind. Price and quantity
+    # are listed separately even though both use the "number" prompt: merging
+    # them into one 0.000-0.285 range made a price box look like it covered the
+    # quantity column, which suppressed cell synthesis below. Repeats are fine
+    # because this is a list.
+    column_kinds:
+      - {kind: number,      from: 0.000, to: 0.163}   # price
+      - {kind: number,      from: 0.163, to: 0.285}   # quantity
+      - {kind: arabic_text, from: 0.285, to: 0.775}   # description
+      - {kind: number,      from: 0.775, to: 0.940}   # total
+
+    # Crops, the numbered overlay, results.json and results.csv land here,
+    # one timestamped folder per page.
+    # Measured failure: the detector merges the description and total columns
+    # into a single box (e.g. one box spanning x=576..1501 on a 1578px page),
+    # which cannot be attributed to a column and gets the wrong prompt. Since
+    # the boundaries above are already known, cut any box that straddles one.
+    split_on_columns: true
+    # A split part narrower than this is a sliver of the printed divider, not
+    # a field. Drop it rather than pay a VLM call for it.
+    min_split_width: 45
+    # A cut lands on the printed column divider, so both halves inherit that
+    # black line at their edge and the model reads it as a glyph -- measured:
+    # a correct total "517,65" became "0-15-78" after splitting. Pull each cut
+    # edge inward to leave the line out.
+    split_inset: 10
+
+    # The printed row numbers 1..15 sit in a gutter past this fraction of the
+    # width. They are pure noise -- 15 boxes, 15 model calls, ~a third of the
+    # runtime -- and produced junk like "12</4>". Skip them.
+    ignore_beyond_x: 0.94
+
+    # Measured: the detector misses a cell when its ink is roughly square
+    # rather than line-shaped. Quantity "16" (aspect 1.78) and "6" (aspect
+    # 1.01) were never boxed; "192" (2.14) and "87" (2.54) always were -- and
+    # "87" carries LESS ink than "16", so this is a shape limit, not a
+    # faintness one, and no DETECTOR threshold can fix it. Instead, group the
+    # detected boxes into rows and synthesise a box for any column missing on
+    # a row that clearly exists.
+    fill_missing_cells: true
+    # Two boxes share a row if their vertical centres are within this fraction
+    # of the taller box's height.
+    row_tolerance: 0.35
+
     debug_dir: "det"
 
 table_extraction:
