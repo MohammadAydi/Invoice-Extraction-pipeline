@@ -25,7 +25,10 @@ Pillow>=10.0
 # service starts without any of them.
 #
 #   pip install surya-ocr==0.17.1 "transformers<5.0"
-#
+
+surya-ocr==0.17.1
+transformers<5.0
+
 # The `surya_qwen` engine additionally runs the VLM in a *second* virtualenv
 # with transformers>=5.0; its path is configured under
 # `ocr.engine_params.worker_python` in config/qwen_config.yaml.
