@@ -158,22 +158,14 @@ def build_line_mask(binary, is_horizontal, w, h,
         return result, bridged
     return result
 
-
-def get_table_cell_bounds(binary_mask, min_size=15, max_area_ratio=0.20,
-                           max_aspect_ratio=0.3):
-    """
-    Returns filtered cell bounding boxes from a binary mask.
-
-    Drops:
-      - blobs smaller than min_size in either dimension (noise)
-      - blobs covering more than max_area_ratio of the image (outer border)
-      - blobs where width/height < max_aspect_ratio (thin vertical slivers)
-      - blobs that fully contain another blob (keep the inner one)
-    """
+def get_table_cell_bounds(binary_mask, min_size=15, min_height=20,
+                           max_area_ratio=0.20, max_aspect_ratio=0.3,
+                           max_width_ratio=0.6):
     _, binary_mask = cv2.threshold(binary_mask, 127, 255, cv2.THRESH_BINARY)
 
-    img_h, img_w  = binary_mask.shape
+    img_h, img_w = binary_mask.shape
     max_cell_area = img_h * img_w * max_area_ratio
+    max_cell_width = img_w * max_width_ratio
 
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_TREE,
                                     cv2.CHAIN_APPROX_SIMPLE)
@@ -182,9 +174,13 @@ def get_table_cell_bounds(binary_mask, min_size=15, max_area_ratio=0.20,
         x, y, w, h = cv2.boundingRect(cnt)
         if w < min_size or h < min_size:
             continue
+        if h < min_height:                  # <-- drop vertically tight cells
+            continue
         if h > 0 and (w / h) < max_aspect_ratio:
             continue
         if w * h > max_cell_area:
+            continue
+        if w > max_cell_width:
             continue
         cell_bounds.append({
             "x": x, "y": y,
@@ -193,9 +189,6 @@ def get_table_cell_bounds(binary_mask, min_size=15, max_area_ratio=0.20,
             "y_max": y + h,
         })
 
-    # --- Drop any cell that fully contains at least one other cell ---
-    # "A contains B" means B's box fits entirely inside A's box.
-    # We keep B (the inner) and discard A (the outer).
     def contains(outer, inner):
         return (outer["x"]     <= inner["x"]     and
                 outer["y"]     <= inner["y"]     and
@@ -208,11 +201,12 @@ def get_table_cell_bounds(binary_mask, min_size=15, max_area_ratio=0.20,
         for j, b in enumerate(cell_bounds):
             if i != j and contains(a, b):
                 is_outer[i] = True
-                break   # one inner cell is enough to condemn the outer
+                break
 
     cell_bounds = [c for i, c in enumerate(cell_bounds) if not is_outer[i]]
 
     return cell_bounds
+
 def find_table_bounds(cells, proximity=1):
     """
     Groups nearby cells with union-find and returns the bounding rectangle
@@ -271,6 +265,279 @@ def find_table_bounds(cells, proximity=1):
         "cells": group_cells,
     }
 
+
+def cluster_cells_into_rows(cells, y_proximity=None):
+    """
+    Groups cells into horizontal rows based on y_center proximity.
+    Returns a list of rows (top to bottom), each row a list of cells
+    sorted left to right.
+    """
+    if not cells:
+        return []
+
+    for c in cells:
+        c["y_center"] = c["y"] + c["height"] / 2
+        c["x_center"] = c["x"] + c["width"] / 2
+
+    if y_proximity is None:
+        # adapt to typical cell height so rows cluster correctly
+        # regardless of image resolution
+        median_h = np.median([c["height"] for c in cells])
+        y_proximity = max(10, median_h * 0.6)
+
+    sorted_cells = sorted(cells, key=lambda c: c["y_center"])
+
+    rows = []
+    current = [sorted_cells[0]]
+    for c in sorted_cells[1:]:
+        # compare against the running average y of the current row,
+        # not just the last cell, so tall/short cells in the same
+        # row don't split it
+        row_y = np.mean([r["y_center"] for r in current])
+        if abs(c["y_center"] - row_y) <= y_proximity:
+            current.append(c)
+        else:
+            rows.append(current)
+            current = [c]
+    rows.append(current)
+
+    for row in rows:
+        row.sort(key=lambda c: c["x_center"])
+
+    return rows
+
+
+def draw_classified_cells(img, cells, output_path="classified_cells.png",
+                           font_scale=0.5, thickness=1):
+    """
+    Draws each cell's bounding box + label directly on the image.
+    Unknown cells are drawn in gray, classified cells in green,
+    with the label text placed inside the box.
+    """
+    vis = img.copy()
+
+    for c in cells:
+        x, y, w, h = c["x"], c["y"], c["width"], c["height"]
+        label = c.get("label", "unknown")
+
+        color = (0, 200, 0) if label != "unknown" else (150, 150, 150)
+        cv2.rectangle(vis, (x, y), (x + w, y + h), color, 2)
+
+        # put text with a small background so it's readable over the scan
+        (text_w, text_h), _ = cv2.getTextSize(
+            label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        text_x, text_y = x + 2, y + text_h + 2
+        cv2.rectangle(vis, (text_x - 1, y),
+                      (text_x + text_w + 1, y + text_h + 4),
+                      (255, 255, 255), -1)
+        cv2.putText(vis, label, (text_x, text_y),
+                    cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, thickness,
+                    cv2.LINE_AA)
+
+    cv2.imwrite(output_path, vis)
+    print(f"Classified cell overlay saved to: {output_path}")
+    return vis
+
+
+def dedup_cells(cells, tol=5):
+    """Removes near-duplicate boxes (same position within tol px)."""
+    seen = []
+    unique = []
+    for c in cells:
+        key = (round(c["x"] / tol), round(c["y"] / tol),
+               round(c["width"] / tol), round(c["height"] / tol))
+        if key in seen:
+            continue
+        seen.append(key)
+        unique.append(c)
+    return unique
+
+
+def nearest_slot(cell_x_center, slot_centers, tol_ratio=0.4, avg_col_width=None):
+    """
+    Finds the closest expected column slot for a cell's x-center.
+    Returns the slot index, or None if too far from every slot.
+    """
+    if avg_col_width is None:
+        avg_col_width = (max(slot_centers) - min(slot_centers)) / max(1, len(slot_centers) - 1)
+    tol = avg_col_width * tol_ratio
+
+    best_idx, best_dist = None, float("inf")
+    for i, sc in enumerate(slot_centers):
+        d = abs(cell_x_center - sc)
+        if d < best_dist:
+            best_dist, best_idx = d, i
+    if best_dist <= tol:
+        return best_idx
+    return None
+
+
+def classify_bill_cells(cells, table_bounds, table_row_count=10, table_col_count=6, debug=True):
+    cells = dedup_cells(cells)
+    for c in cells:
+        c["label"] = "unknown"
+        c["y_center"] = c["y"] + c["height"] / 2
+        c["x_center"] = c["x"] + c["width"] / 2
+
+    # --- Split cells by position relative to table_bounds ---
+    if table_bounds:
+        t_y1, t_y2 = table_bounds["y1"], table_bounds["y2"]
+        tol = 10  # px tolerance — catches cells that bleed slightly outside table_bounds
+        pre_cells = [c for c in cells if c["y_center"] < t_y1 - tol]
+        table_cells = [c for c in cells if t_y1 - tol <= c["y_center"] <= t_y2 + tol]
+        post_cells = [c for c in cells if c["y_center"] > t_y2 + tol]
+    else:
+        # fallback: old row-clustering split (no table_bounds available)
+        rows = cluster_cells_into_rows(cells)
+        pre_cells, table_cells, post_cells = _split_by_rows(rows, table_col_count, debug)
+
+    if debug:
+        print(f"\nTotal cells after dedup: {len(cells)}")
+        print(f"  above table : {len(pre_cells)}")
+        print(f"  inside table: {len(table_cells)}")
+        print(f"  below table : {len(post_cells)}")
+
+    # --- Step 1: classify table interior ---
+    rows = cluster_cells_into_rows(table_cells)
+
+    if debug:
+        print(f"  table clustered into {len(rows)} rows:")
+        for i, row in enumerate(rows):
+            print(f"    row {i}: {len(row)} cell(s)  x={[c['x'] for c in row]}")
+
+    col_labels = ["notes", "total_price", "unit_price",
+                  "quantity", "product_name", "number"]
+
+    # locate the longest run of ~6-cell rows (tolerant of split digits)
+    run_start, run_len = None, 0
+    cur_start, cur_len = None, 0
+    for i, row in enumerate(rows):
+        if table_col_count <= len(row) <= table_col_count + 5:
+            if cur_start is None:
+                cur_start = i
+            cur_len += 1
+        else:
+            if cur_len > run_len:
+                run_start, run_len = cur_start, cur_len
+            cur_start, cur_len = None, 0
+    if cur_len > run_len:
+        run_start, run_len = cur_start, cur_len
+
+    if run_start is None:
+        if debug:
+            print("  -> could not find product table block, aborting classification")
+        return cells
+
+    # header always exists
+    table_rows = rows[run_start:run_start + run_len]
+    data_rows  = table_rows[1:1 + table_row_count]
+
+    # build column template from clean rows only
+    clean_table_rows = [r for r in table_rows if len(r) == table_col_count]
+    if not clean_table_rows:
+        clean_table_rows = table_rows
+    col_slot_centers = []
+    for col_idx in range(table_col_count):
+        xs = [r[col_idx]["x_center"] for r in clean_table_rows if len(r) > col_idx]
+        col_slot_centers.append(np.median(xs) if xs else None)
+
+    valid_centers = [c for c in col_slot_centers if c is not None]
+    avg_col_width = None
+    if len(valid_centers) >= 2:
+        avg_col_width = (max(valid_centers) - min(valid_centers)) / (table_col_count - 1)
+
+    # label header
+    for cell in table_rows[0]:
+        slot = nearest_slot(cell["x_center"], valid_centers, avg_col_width=avg_col_width)
+        if slot is not None:
+            real_idx = col_slot_centers.index(valid_centers[slot])
+            cell["label"] = f"{col_labels[real_idx]}_header"
+
+    # label data rows
+    for r_idx, row in enumerate(data_rows):
+        for cell in row:
+            slot = nearest_slot(cell["x_center"], valid_centers, avg_col_width=avg_col_width)
+            if slot is not None:
+                real_idx = col_slot_centers.index(valid_centers[slot])
+                cell["label"] = f"{col_labels[real_idx]}_{r_idx + 1}"
+
+    if debug:
+        print(f"  -> product table: rows {run_start}..{run_start + run_len - 1} "
+              f"({len(data_rows)} data rows, "
+              f"columns={[round(c) if c else None for c in col_slot_centers]})")
+
+    # --- Step 2: bill_id / city / date / name ---
+    if pre_cells:
+        xs = [c["x_center"] for c in pre_cells]
+        ys = [c["y_center"] for c in pre_cells]
+        x_min, x_max = min(xs), max(xs)
+        y_min, y_max = min(ys), max(ys)
+        x_range = max(x_max - x_min, 1)
+        y_range = max(y_max - y_min, 1)
+
+        def top_left_score(c):
+            nx = (c["x_center"] - x_min) / x_range
+            ny = (c["y_center"] - y_min) / y_range
+            return nx + ny
+
+        bill_id_cell = min(pre_cells, key=top_left_score)
+        bill_id_cell["label"] = "bill_id"
+
+        if debug:
+            print(f"  -> bill_id: x={bill_id_cell['x']}, y={bill_id_cell['y']} "
+                  f"(score={top_left_score(bill_id_cell):.2f})")
+
+        remaining = [c for c in pre_cells if c is not bill_id_cell]
+        if remaining:
+            rxs = [c["x_center"] for c in remaining]
+            rx_min, rx_max = min(rxs), max(rxs)
+            rwidth = max(rx_max - rx_min, 1)
+            cdn_labels = ["city", "date", "name"]
+            for c in remaining:
+                frac = (c["x_center"] - rx_min) / rwidth
+                bucket = min(2, int(frac * 3))
+                c["label"] = cdn_labels[bucket]
+        elif debug:
+            print("  -> no cells left for city/date/name after bill_id")
+    elif debug:
+        print("  -> no cells found above product table")
+
+    # --- Step 3: totals row ---
+    totals_candidates = []
+
+    # Priority 1: Check if totals row is inside table_cells right after data rows
+    after_data_idx = run_start + 1 + len(data_rows)
+    after_run_idx = run_start + run_len
+
+    if after_data_idx < len(rows):
+        totals_candidates = rows[after_data_idx]
+    elif after_run_idx < len(rows):
+        totals_candidates = rows[after_run_idx]
+    elif post_cells:
+        # Priority 2: Fallback to post_cells if table_bounds excluded the totals row
+        post_rows = cluster_cells_into_rows(post_cells)
+        totals_candidates = post_rows[0] if post_rows else []
+
+    if totals_candidates:
+        post_sorted = sorted(totals_candidates, key=lambda c: c["x_center"])
+        labels_ltr = ["space_1", "katba", "space_2", "raqman", "total_price_sum"]
+        if len(post_sorted) == 5:
+            for cell, label in zip(post_sorted, labels_ltr):
+                cell["label"] = label
+        else:
+            x_min = post_sorted[0]["x_center"]
+            x_max = post_sorted[-1]["x_center"]
+            width = max(x_max - x_min, 1)
+            for c in post_sorted:
+                frac = (c["x_center"] - x_min) / width
+                bucket = min(4, int(frac * 5))
+                c["label"] = labels_ltr[bucket]
+        if debug:
+            print(f"  -> totals row classified ({len(post_sorted)} cell(s))")
+    elif debug:
+        print("  -> no totals row found")
+
+    return cells
 
 def detect_table_grid(
     image_path,
@@ -458,6 +725,11 @@ def _run_single_image(image_path, image_output_dir, **kwargs):
     cells, grid_mask, table_bounds = detect_table_grid(
         image_path, result_path=result_path, steps_dir=steps_dir, **kwargs
     )
+
+    cells = classify_bill_cells(cells, table_bounds=table_bounds, debug=True)
+
+    img = cv2.imread(image_path)
+    draw_classified_cells(img, cells, output_path=os.path.join(image_output_dir , "classified_cells.png"))
 
     for fname in ("grid_mask_debug.png", "binary_debug.png"):
         if os.path.exists(fname):
