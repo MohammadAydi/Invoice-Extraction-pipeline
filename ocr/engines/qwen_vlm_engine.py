@@ -70,14 +70,19 @@ def to_pil(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(arr).convert("RGB")
 
 
-def fit_for_model(img: Image.Image) -> Image.Image:
+def fit_for_model(img: Image.Image, arch: str = "qwen3_5") -> Image.Image:
     if max(img.size) > MAX_SIDE:
         img.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
+    if arch != "qwen3_5":
+        # Qwen2.5-VL يحجّم داخلياً برقعة 28؛ أي تحجيم مسبق هنا تشويه زائد.
+        return img
     w, h = img.size
     nw = ((w + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
     nh = ((h + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
     if (nw, nh) != (w, h):
-        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGB", (nw, nh), (255, 255, 255))
+        canvas.paste(img, ((nw - w) // 2, (nh - h) // 2))
+        img = canvas
     return img
 
 

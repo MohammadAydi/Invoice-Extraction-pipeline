@@ -1,26 +1,20 @@
 preprocessing:
-  # Geometric steps are NOT touched: they fix real distortion (a phone photo
-  # taken at an angle) and are the only steps that change coordinates.
   geometric_steps:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
     - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
 
   ocr_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-
     - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
-
     - {name: clahe, enabled: false, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
-
     - {name: bilateral_filter, enabled: false, params: {d: 5, sigma_color: 50, sigma_space: 50}}
-
     - {name: adaptive_threshold, enabled: false, params: {block_size: 51, c: 35}}
-
     - {name: morphological_cleanup, enabled: false, params: {operation: open, kernel_size: 2}}
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+    # تم التعطيل: لمنع ظهور النقاط السوداء (الضوضاء) التي استنزفت 10 ثوانٍ في هلوسات فارغة
+    - {name: adaptive_threshold, enabled: false, params: {block_size: 25, c: 35}}
 
 ocr:
   engine: surya_qwen
@@ -37,16 +31,18 @@ ocr:
     upscale: 2
 
     column_kinds:
-      - {kind: number,      from: 0.000, to: 0.163}   # price
-      - {kind: number,      from: 0.163, to: 0.285}   # quantity
-      - {kind: arabic_text, from: 0.285, to: 0.775}   # description
-      - {kind: number,      from: 0.775, to: 0.940}   # total
+      - {kind: arabic_text, from: 0.000, to: 0.270}   # ملاحظات
+      - {kind: number,      from: 0.270, to: 0.430}   # السعر الإجمالي
+      - {kind: number,      from: 0.430, to: 0.610}   # السعر الإفرادي
+      - {kind: number,      from: 0.610, to: 0.710}   # العدد
+      - {kind: arabic_text, from: 0.710, to: 0.960}   # اسم المنتج
 
 
     split_on_columns: true
     min_split_width: 45
     split_inset: 10
-    ignore_beyond_x: 0.94
+
+    ignore_beyond_x: 0.96
 
     fill_missing_cells: true
     row_tolerance: 0.35
