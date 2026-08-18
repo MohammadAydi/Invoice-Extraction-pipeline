@@ -254,7 +254,8 @@ class HybridSuryaQwenEngine:
         print(f"[surya_qwen] total recognize(): {total_time:.2f}s "
               f"(detect {detect_time:.2f}s + ocr {ocr_total_time:.2f}s "
               f"+ overhead {overhead:.2f}s [box splitting, debug save, etc.])")
-
+        self.last_debug_dir = out_dir
+        self.last_page_size = (w, h)
         return OCRResult(
             fragments=fragments,
             engine_name="surya_qwen",

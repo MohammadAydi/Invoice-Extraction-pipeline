@@ -1,33 +1,29 @@
 # ocr/engines/qwen_vlm_engine.py
-"""Arabic OCR VLMs as an OCREngine, with per-architecture prompting.
+"""Arabic-Qwen3.5-OCR-v4 as an OCREngine.
 
 This is a *recognition-only* model: it reads whatever is in the image it is
 handed and has no notion of layout. On a full invoice page it hallucinates
-(measured: Chinese glyphs and LaTeX). Feed it a single field crop instead --
-see HybridSuryaQwenEngine, which pairs Surya's detector with this engine.
+(measured: Chinese glyphs and LaTeX on this project's sample). Feed it a single
+field crop instead — see HybridSuryaQwenEngine, which pairs Surya's detector
+with this engine.
 
-Two architectures are supported, selected by `arch` in engine_params:
-
-  qwen3_5      Arabic-Qwen3.5-OCR-v4. Tuned for printed text. Measured on the
-               sample invoice: 3/12 numeric cells, descriptions poor.
-  qwen2_5_vl   Arabic-handwritten-OCR-*-Qwen2.5-VL-3B. Tuned for handwriting.
-               Measured: 1/12 numeric cells but far better descriptions --
-               "باراشوت ملون" read exactly right, which qwen3_5 never managed.
-
-The prompts differ per architecture and this is NOT cosmetic. The qwen3_5
-number prompt spells out the Arabic-Indic digits because naming them is what
-suppresses that model's digit->Latin transliteration (٥->O, ٧->V, ٨->A).
-Qwen2.5-VL does not have that failure mode, and instead COPIES the digit list
-straight into its answer -- measured outputs "العدد\\n\\n0123456789" and
-"Quantity\\n\\n123456789". So its prompts must never contain literal digits.
-
-Three backends, chosen by `backend`:
+Three backends, chosen by `backend` in engine_params:
 
   "subprocess"    RECOMMENDED. Spawns tools/qwen_worker.py using a second
-                  venv's python.exe with transformers>=5.0. No server, no GGUF.
-  "http"          talks to a local Ollama / llama-server.
-  "transformers"  loads in-process; needs transformers>=5.0, which conflicts
-                  with surya-ocr 0.17.1.
+                  venv's python.exe, which has transformers>=5.0, and talks to
+                  it over stdin/stdout. Needs no server and no GGUF
+                  conversion; the HF safetensors are used as downloaded. The
+                  model loads once and is reused for the whole batch.
+
+  "http"          talks to a local Ollama / llama-server. Needs the model
+                  converted to GGUF and a server running on `host`.
+
+  "transformers"  loads the safetensors in-process. Requires transformers>=5.0,
+                  which CONFLICTS with surya-ocr 0.17.1, so this only works in
+                  a venv where Surya is absent.
+
+Every heavy import is deliberately lazy (inside __init__, not at module scope)
+so that merely importing this module never breaks the Surya-only environment.
 """
 
 from __future__ import annotations
@@ -36,7 +32,6 @@ import base64
 import io
 import json
 import os
-import re
 
 import numpy as np
 from PIL import Image
@@ -46,57 +41,27 @@ from core.domain.image_payload import ImagePayload
 from core.domain.ocr import OCRFragment, OCRResult
 from ocr.registry import engine_registry
 
-# ---------------------------------------------------------------- prompts
-
-PROMPTS_BY_ARCH = {
-    # Measured and tuned on this project's sample. Do not "simplify" these:
-    # the explicit digit list is load-bearing here.
-    "qwen3_5": {
-        "number": (
-            "هذه خانة من فاتورة، تحتوي رقماً مكتوباً بخط اليد بالأرقام الهندية "
-            "(٠١٢٣٤٥٦٧٨٩) وقد يحتوي فاصلة عشرية. اكتب الرقم فقط بالأرقام "
-            "الإنجليزية 0-9. لا تكتب أي حرف أبداً. إن كانت الخانة فارغة أو غير "
-            "مقروءة فاكتب: EMPTY"
-        ),
-        "arabic_text": (
-            "هذه خانة من فاتورة، تحتوي وصف منتج مكتوباً بخط اليد بالعربية. "
-            "اكتب النص كما هو تماماً. قد تظهر أسماء ماركات أجنبية. "
-            "إن كانت الخانة فارغة أو غير مقروءة فاكتب: EMPTY"
-        ),
-        "any": "اقرأ النص في هذه الصورة كاملاً من البداية إلى النهاية.",
-    },
-
-    # NO literal digits anywhere -- this model copies them into its answer.
-    # Also kept short: its measured failures include echoing the instruction
-    # ("Quantity", "Price", "العدد") before answering, which a long prompt
-    # makes worse.
-    "qwen2_5_vl": {
-        "number": (
-            "اكتب الرقم المكتوب بخط اليد في هذه الصورة. "
-            "أرقاماً فقط، بلا أي كلمة أو شرح أو تكرار. "
-            "إن لم يكن فيها رقم فاكتب: EMPTY"
-        ),
-        "arabic_text": (
-            "اكتب النص العربي المكتوب بخط اليد في هذه الصورة كما هو، "
-            "مرة واحدة فقط وبلا شرح. "
-            "إن كانت فارغة فاكتب: EMPTY"
-        ),
-        "any": "اقرأ ما هو مكتوب في هذه الصورة.",
-    },
+# Prompts are Arabic because the model was fine-tuned on Arabic instructions.
+# The "number" prompt exists because the model transliterates Arabic-Indic
+# digits into look-alike Latin letters: ٥->O, ٧->V, ٨->A. Naming the mapping
+# explicitly is what suppresses it.
+PROMPTS = {
+    "number": (
+        "هذه خانة من فاتورة، تحتوي رقماً مكتوباً بخط اليد بالأرقام الهندية "
+        "(٠١٢٣٤٥٦٧٨٩) وقد يحتوي فاصلة عشرية. اكتب الرقم فقط بالأرقام "
+        "الإنجليزية 0-9. لا تكتب أي حرف أبداً. إن كانت الخانة فارغة أو غير "
+        "مقروءة فاكتب: EMPTY"
+    ),
+    "arabic_text": (
+        "هذه خانة من فاتورة، تحتوي وصف منتج مكتوباً بخط اليد بالعربية. "
+        "اكتب النص كما هو تماماً. قد تظهر أسماء ماركات أجنبية. "
+        "إن كانت الخانة فارغة أو غير مقروءة فاكتب: EMPTY"
+    ),
+    "any": "اقرأ النص في هذه الصورة كاملاً من البداية إلى النهاية.",
 }
 
-# Preserved so `from ... import PROMPTS` keeps working (HybridSuryaQwenEngine
-# validates column_kinds against it).
-PROMPTS = PROMPTS_BY_ARCH["qwen3_5"]
-
-MAX_SIDE = 768   # the qwen3_5 model card's own prepare_image cap
-MULTIPLE = 64    # qwen3_5 requires both dimensions to be multiples of 64
-
-# Measured echo artefacts: the model reproduces a digit run from the prompt
-# instead of reading the cell. A cell never legitimately contains a full
-# ascending 0-9 sequence, so dropping these is safe.
-_ECHO_RUNS = {"0123456789", "123456789", "٠١٢٣٤٥٦٧٨٩", "١٢٣٤٥٦٧٨٩"}
-_SENTINEL = re.compile(r"empty", re.IGNORECASE)
+MAX_SIDE = 768   # the model card's own prepare_image cap
+MULTIPLE = 64    # the model requires both dimensions to be multiples of 64
 
 
 def to_pil(arr: np.ndarray) -> Image.Image:
@@ -105,79 +70,15 @@ def to_pil(arr: np.ndarray) -> Image.Image:
     return Image.fromarray(arr).convert("RGB")
 
 
-def fit_for_model(img: Image.Image, arch: str = "qwen3_5") -> Image.Image:
-    """Size the crop for the target architecture.
-
-    qwen2_5_vl returns as-is: its processor calls smart_resize on a 28px patch
-    grid, so any resize here is a second resample stacked on the glyphs.
-
-    qwen3_5 pads to a multiple of 64 rather than resizing to it -- resizing
-    changes the aspect ratio (a 220x90 crop became 256x128, a 42% vertical
-    stretch), which is a prime suspect for handwritten digit confusion.
-    """
+def fit_for_model(img: Image.Image) -> Image.Image:
     if max(img.size) > MAX_SIDE:
         img.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
-
-    if arch != "qwen3_5":
-        return img
-
     w, h = img.size
     nw = ((w + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
     nh = ((h + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
-    if (nw, nh) == (w, h):
-        return img
-    canvas = Image.new("RGB", (nw, nh), (255, 255, 255))
-    canvas.paste(img, ((nw - w) // 2, (nh - h) // 2))
-    return canvas
-
-
-def clean_output(text: str, kind: str) -> str:
-    """Strips the artefacts these models add around their actual answer.
-
-    Every rule here comes from a measured failure, not from caution:
-
-      "... ...EMPTY"          sentinel glued to filler -- the engine's exact
-                              `== "EMPTY"` check misses it and the junk is
-                              kept as if it were a reading
-      "العدد\\n\\n0123456789"   prompt echo appended after the answer
-      "76......"              trailing dot runs from the printed dotted rule
-      "١٤٨١۲,۵\\t\\t14812,50"   the same number emitted twice in two scripts
-
-    Returns "" for a cell with no usable content, which is honest -- an empty
-    cell is better than filler that downstream code treats as data.
-    """
-    if not text:
-        return ""
-
-    # Split on the separators the models use between their multiple attempts.
-    segments = [s.strip() for s in re.split(r"[\n\t]+", text) if s.strip()]
-    if not segments:
-        return ""
-
-    cleaned = []
-    for seg in segments:
-        seg = _SENTINEL.sub("", seg).strip()
-        if not seg:
-            continue
-        # Trailing/leading dot runs come from the dotted rule the crop caught,
-        # never from the handwriting. Internal separators are left alone --
-        # "٥,٧," is a real decimal reading and must survive.
-        seg = re.sub(r"^[.\u2026\s]+|[.\u2026\s]+$", "", seg).strip()
-        if not seg or seg in _ECHO_RUNS:
-            continue
-        cleaned.append(seg)
-
-    if not cleaned:
-        return ""
-
-    if kind == "number":
-        # In a numeric column, a segment with no digit is either a prompt echo
-        # ("Quantity", "العدد") or a hallucinated word. Prefer the first
-        # segment that actually contains a digit.
-        with_digits = [s for s in cleaned if re.search(r"[0-9\u0660-\u0669\u06F0-\u06F9]", s)]
-        return with_digits[0] if with_digits else ""
-
-    return cleaned[0]
+    if (nw, nh) != (w, h):
+        img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+    return img
 
 
 @engine_registry.register("qwen_vlm")
@@ -189,9 +90,7 @@ class QwenVLMEngine:
         host: str = "http://localhost:11434",
         model_name: str = "arabic-ocr",
         kind: str = "any",
-        arch: str = "qwen3_5",
         max_new_tokens: int = 64,
-        max_new_tokens_by_kind: dict | None = None,
         worker_python: str = r"D:\OCR\.venv_vlm\Scripts\python.exe",
         worker_script: str = "tools/qwen_worker.py",
         **engine_params,
@@ -202,17 +101,8 @@ class QwenVLMEngine:
         self.model_name = model_name
         self.kind = kind
         self.max_new_tokens = max_new_tokens
-        self.max_new_tokens_by_kind = dict(max_new_tokens_by_kind or {})
         self.worker_python = worker_python
         self.worker_script = worker_script
-
-        if arch not in PROMPTS_BY_ARCH:
-            raise ValueError(
-                f"unknown arch: {arch!r}. Known: {sorted(PROMPTS_BY_ARCH)}. "
-                "This must match the model at model_path -- the wrong value "
-                "sends the wrong prompt and silently degrades every cell.")
-        self.arch = arch
-        self.prompts = PROMPTS_BY_ARCH[arch]
 
         self._proc = None
         if backend == "transformers":
@@ -224,29 +114,22 @@ class QwenVLMEngine:
                 f"unknown backend: {backend!r} "
                 '(expected "subprocess", "http" or "transformers")')
 
-    def _tokens_for(self, kind: str) -> int:
-        return int(self.max_new_tokens_by_kind.get(kind, self.max_new_tokens))
-
     # -- backends ---------------------------------------------------------
     def _init_transformers(self):
         import torch
         import transformers
         from transformers import AutoProcessor
 
-        cls_name = {"qwen3_5": "Qwen3_5ForConditionalGeneration",
-                    "qwen2_5_vl": "Qwen2_5_VLForConditionalGeneration"}[self.arch]
-        cls = getattr(transformers, cls_name, None)
+        cls = getattr(transformers, "Qwen3_5ForConditionalGeneration", None)
         if cls is None:
             raise RuntimeError(
-                f"transformers {transformers.__version__} cannot load "
-                f"{cls_name} (Qwen3.5 needs >=5.0). This venv is pinned to "
-                '<5.0 for surya-ocr; use backend: "subprocess" instead.')
+                f"transformers {transformers.__version__} cannot load Qwen3.5 "
+                "(needs >=5.0). This venv is pinned to <5.0 for surya-ocr; use "
+                'backend: "http" here, or run this engine in a separate venv.'
+            )
         self._torch = torch
         self._device = "cuda" if torch.cuda.is_available() else "cpu"
-        # bfloat16, not float16: both models are stored in BF16, which has a
-        # wider exponent range. Down-casting to FP16 can saturate large
-        # weights, and that shows up as changed output rather than an error.
-        self._dtype = torch.bfloat16 if self._device == "cuda" else torch.float32
+        self._dtype = torch.float16 if self._device == "cuda" else torch.float32
         self._processor = AutoProcessor.from_pretrained(
             self.model_path, trust_remote_code=True)
         self._model = cls.from_pretrained(
@@ -257,8 +140,7 @@ class QwenVLMEngine:
             low_cpu_mem_usage=True,
         ).eval()
 
-    def _read_transformers(self, img: Image.Image, prompt: str,
-                           max_tokens: int) -> str:
+    def _read_transformers(self, img: Image.Image, prompt: str) -> str:
         from qwen_vl_utils import process_vision_info
 
         messages = [{"role": "user", "content": [
@@ -270,11 +152,11 @@ class QwenVLMEngine:
         image_inputs, _ = process_vision_info(messages)
         inputs = self._processor(text=[text_input], images=image_inputs,
                                  padding=True,
-                                 return_tensors="pt").to(self._model.device)
+                                 return_tensors="pt").to(self._device)
         with self._torch.inference_mode():
             out = self._model.generate(
                 **inputs,
-                max_new_tokens=max_tokens,
+                max_new_tokens=self.max_new_tokens,
                 do_sample=False,            # same crop must give same answer
                 repetition_penalty=1.2,
                 no_repeat_ngram_size=3,
@@ -287,7 +169,12 @@ class QwenVLMEngine:
             clean_up_tokenization_spaces=False)[0].strip()
 
     def _init_subprocess(self, engine_params):
-        """Spawn the worker in the OTHER venv and wait for it to load."""
+        """Spawn the worker in the OTHER venv and wait for it to load.
+
+        This is the backend that needs no server and no GGUF conversion: the
+        HF safetensors are used directly, just in a process where
+        transformers>=5.0 is installed.
+        """
         import atexit
         import subprocess
 
@@ -298,13 +185,12 @@ class QwenVLMEngine:
         if not os.path.exists(self.worker_script):
             raise FileNotFoundError(f"worker_script not found: {self.worker_script}")
 
-        # --arch is passed explicitly rather than left to the worker's own
-        # config.json sniffing, so the prompt selected here and the image
-        # preprocessing done there can never disagree.
         cmd = [self.worker_python, self.worker_script,
                "--model", self.model_path,
-               "--arch", self.arch,
                "--max-new-tokens", str(self.max_new_tokens)]
+        # PYTHONIOENCODING belts-and-braces with the worker's own
+        # reconfigure(): on Windows the child would otherwise inherit a cp125x
+        # console encoding and mangle every Arabic reply.
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -313,10 +199,12 @@ class QwenVLMEngine:
         )
         atexit.register(self._shutdown)
 
-        print(f"[qwen] loading model in worker ({self.model_path}, "
-              f"arch={self.arch}) ...")
-        # transformers prints assorted warnings to STDOUT during load. Skip
-        # every line until the worker's own READY sentinel.
+        print(f"[qwen] loading model in worker ({self.model_path}) ...")
+        # transformers prints assorted warnings to STDOUT during load (e.g.
+        # "[ERROR] `min_frames` is part of Qwen3VLVideoProcessorInitKwargs..."
+        # which is a harmless docstring check, not a failure). Skip every line
+        # until the worker's own READY sentinel, instead of treating the first
+        # line as the answer.
         noise = []
         while True:
             line = self._proc.stdout.readline()
@@ -340,19 +228,17 @@ class QwenVLMEngine:
             except Exception:                              # noqa: BLE001
                 self._proc.kill()
 
-    def _read_subprocess(self, img: Image.Image, prompt: str,
-                         max_tokens: int) -> str:
+    def _read_subprocess(self, img: Image.Image, prompt: str) -> str:
         if self._proc is None or self._proc.poll() is not None:
             raise RuntimeError("qwen worker is not running")
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         req = {"image": base64.b64encode(buf.getvalue()).decode(),
-               "prompt": prompt,
-               # Honoured only by a worker that reads it; older workers ignore
-               # the extra key and fall back to their --max-new-tokens.
-               "max_new_tokens": max_tokens}
+               "prompt": prompt}
         self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
+        # Same defence as at startup: a stray transformers warning on stdout
+        # must not be parsed as the reply. Read until a line parses as JSON.
         while True:
             line = self._proc.stdout.readline()
             if not line:
@@ -370,7 +256,7 @@ class QwenVLMEngine:
             raise RuntimeError(resp["error"])
         return resp.get("text", "").strip()
 
-    def _read_http(self, img: Image.Image, prompt: str, max_tokens: int) -> str:
+    def _read_http(self, img: Image.Image, prompt: str) -> str:
         import requests
 
         buf = io.BytesIO()
@@ -382,36 +268,25 @@ class QwenVLMEngine:
             "prompt": prompt,
             "images": [b64],
             "stream": False,
-            "options": {"temperature": 0, "num_predict": max_tokens},
+            "options": {"temperature": 0, "num_predict": self.max_new_tokens},
         }, timeout=600)
         r.raise_for_status()
         return r.json().get("response", "").strip()
 
     # -- public API -------------------------------------------------------
     def read(self, img: Image.Image, kind: str | None = None) -> str:
-        kind = kind or self.kind
-        prompt = self.prompts.get(kind, self.prompts["any"])
-        max_tokens = self._tokens_for(kind)
-
+        prompt = PROMPTS.get(kind or self.kind, PROMPTS["any"])
+        img = fit_for_model(img)
+        if self.backend == "transformers":
+            return self._read_transformers(img, prompt)
         if self.backend == "subprocess":
-            # Do NOT fit here. The worker sizes the crop itself, and doing it
-            # on both sides means two resamples stacked on the same glyphs --
-            # exactly the distortion the padding change was meant to remove.
-            # One place owns sizing: the worker.
-            raw = self._read_subprocess(img, prompt, max_tokens)
-        elif self.backend == "transformers":
-            raw = self._read_transformers(
-                fit_for_model(img, self.arch), prompt, max_tokens)
-        else:
-            raw = self._read_http(
-                fit_for_model(img, self.arch), prompt, max_tokens)
-
-        return clean_output(raw, kind)
+            return self._read_subprocess(img, prompt)
+        return self._read_http(img, prompt)
 
     def recognize(self, image: ImagePayload) -> OCRResult:
         """Whole-image recognition. The model returns text with no coordinates,
         so a single fragment spanning the full frame is the honest
-        representation -- do not fabricate per-line boxes it never produced."""
+        representation — do not fabricate per-line boxes it never produced."""
         pil = to_pil(image.image)
         text = self.read(pil)
         h, w = image.image.shape[:2]
