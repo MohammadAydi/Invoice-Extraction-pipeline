@@ -13,7 +13,8 @@ preprocessing:
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+    # تم التعطيل: لمنع ظهور النقاط السوداء (الضوضاء) التي استنزفت 10 ثوانٍ في هلوسات فارغة
+    - {name: adaptive_threshold, enabled: false, params: {block_size: 25, c: 35}}
 
 ocr:
   engine: surya_qwen
@@ -21,11 +22,8 @@ ocr:
     backend: subprocess
     worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
     worker_script: "tools/qwen_worker.py"
-    #model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
-    model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
-    arch: qwen2_5_vl
+    model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
     max_new_tokens: 64
-
 
     kind: any
 
@@ -33,15 +31,18 @@ ocr:
     upscale: 2
 
     column_kinds:
-      - { kind: number,      from: 0.000, to: 0.163, role: price }
-      - { kind: number,      from: 0.163, to: 0.285, role: qty }
-      - { kind: arabic_text, from: 0.285, to: 0.775, role: desc }
-      - { kind: number,      from: 0.775, to: 0.940, role: total }
+      - {kind: arabic_text, from: 0.000, to: 0.270}   # ملاحظات
+      - {kind: number,      from: 0.270, to: 0.430}   # السعر الإجمالي
+      - {kind: number,      from: 0.430, to: 0.610}   # السعر الإفرادي
+      - {kind: number,      from: 0.610, to: 0.710}   # العدد
+      - {kind: arabic_text, from: 0.710, to: 0.960}   # اسم المنتج
+
 
     split_on_columns: true
     min_split_width: 45
     split_inset: 10
-    ignore_beyond_x: 0.94
+
+    ignore_beyond_x: 0.96
 
     fill_missing_cells: true
     row_tolerance: 0.35

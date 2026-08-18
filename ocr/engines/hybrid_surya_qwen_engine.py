@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import csv
 import json
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -155,11 +156,17 @@ class HybridSuryaQwenEngine:
         return self.reader.kind
 
     def recognize(self, image: ImagePayload) -> OCRResult:
+        total_start = time.perf_counter()
+
         arr = image.image
         pil = to_pil(arr)
         w, h = pil.size
 
+        detect_start = time.perf_counter()
         det = self.det_predictor([pil])[0]
+        detect_time = time.perf_counter() - detect_start
+        print(f"[surya_qwen] detection: {detect_time:.2f}s "
+              f"({len(det.bboxes)} raw box(es))")
 
         out_dir = None
         if self.debug_dir is not None:
@@ -185,6 +192,7 @@ class HybridSuryaQwenEngine:
         # Reading order: top to bottom, then right to left.
         raw_boxes.sort(key=lambda t: (round(t[0][1] / 20), -t[0][0]))
 
+        ocr_start = time.perf_counter()
         for (x1, y1, x2, y2), box in raw_boxes:
             cx1, cy1 = max(0, x1 - self.pad), max(0, y1 - self.pad)
             cx2, cy2 = min(w, x2 + self.pad), min(h, y2 + self.pad)
@@ -197,15 +205,20 @@ class HybridSuryaQwenEngine:
                     Image.Resampling.LANCZOS)
 
             kind = self._kind_for((x1 + x2) / 2, w)
+            crop_start = time.perf_counter()
             try:
                 text = self.reader.read(crop, kind=kind)
             except Exception as exc:                      # noqa: BLE001
                 # One unreadable field must not abort a whole invoice.
                 text = ""
                 print(f"[surya_qwen] crop at {(x1, y1, x2, y2)} failed: {exc}")
+            crop_time = time.perf_counter() - crop_start
 
             if text.strip().upper() == "EMPTY":
                 text = ""
+
+            print(f"[surya_qwen] crop {len(fragments) + 1:03d} "
+                  f"({kind}): {crop_time:.3f}s -> {text!r}")
 
             fragments.append(OCRFragment(
                 text=text,
@@ -225,14 +238,38 @@ class HybridSuryaQwenEngine:
                     "detect_confidence": (getattr(box, "confidence", None)
                                           if box is not None else None),
                     "synthesised": box is None,
+                    "read_time_s": round(crop_time, 3),
                 })
+        ocr_total_time = time.perf_counter() - ocr_start
+        crop_count = len(fragments)
+        avg_crop_time = ocr_total_time / crop_count if crop_count else 0.0
+        print(f"[surya_qwen] all crops: {ocr_total_time:.2f}s for "
+              f"{crop_count} crop(s) (avg {avg_crop_time:.3f}s/crop)")
 
         if out_dir is not None:
             self._save_debug(out_dir, pil, rows)
 
-        return OCRResult(fragments=fragments,
-                         engine_name="surya_qwen",
-                         raw_engine_output=det)
+        total_time = time.perf_counter() - total_start
+        overhead = total_time - detect_time - ocr_total_time
+        print(f"[surya_qwen] total recognize(): {total_time:.2f}s "
+              f"(detect {detect_time:.2f}s + ocr {ocr_total_time:.2f}s "
+              f"+ overhead {overhead:.2f}s [box splitting, debug save, etc.])")
+        self.last_debug_dir = out_dir
+        self.last_page_size = (w, h)
+        return OCRResult(
+            fragments=fragments,
+            engine_name="surya_qwen",
+            raw_engine_output={
+                "det": det,
+                "timing": {
+                    "detect_s": round(detect_time, 3),
+                    "ocr_total_s": round(ocr_total_time, 3),
+                    "ocr_avg_per_crop_s": round(avg_crop_time, 3),
+                    "total_s": round(total_time, 3),
+                    "crop_count": crop_count,
+                },
+            },
+        )
 
     def _save_overlay(self, out_dir: Path, page, rows):
         """Draw every detected box, numbered to match its crop filename.
@@ -266,7 +303,8 @@ class HybridSuryaQwenEngine:
                   newline="") as f:
             w = csv.DictWriter(f, fieldnames=["file", "text", "kind",
                                               "x", "y", "w", "h",
-                                              "detect_confidence"])
+                                              "detect_confidence", "synthesised",
+                                              "read_time_s"])
             w.writeheader()
             w.writerows(rows)
         print(f"[surya_qwen] {len(rows)} crops + results -> {out_dir}")

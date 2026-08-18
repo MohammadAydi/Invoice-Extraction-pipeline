@@ -1,21 +1,3 @@
-# tools/qwen_worker.py
-"""Long-lived Qwen worker, run inside the transformers>=5.0 venv.
-
-Exists because Qwen3.5 needs transformers>=5.0 while surya-ocr 0.17.1 pins
-<5.0. They cannot share a process, so the main pipeline spawns this script
-with the other venv's python.exe and talks to it over stdin/stdout.
-
-Protocol: one JSON object per line in, one per line out.
-    in   {"image": "<base64 png>", "prompt": "..."}
-    out  {"text": "..."} or {"error": "..."}
-    "READY" is printed once the model is loaded.
-
-The model is loaded ONCE and reused for every crop. Loading per crop would
-add roughly a minute each on CPU.
-
-    python tools/qwen_worker.py --model D:\\Arabic-Qwen3.5-OCR-v4
-"""
-
 from __future__ import annotations
 
 import argparse
@@ -24,6 +6,7 @@ import io
 import json
 import os
 import sys
+from pathlib import Path
 
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
@@ -58,26 +41,53 @@ def main():
     args = ap.parse_args()
 
     import transformers
-    from transformers import AutoProcessor
+    from transformers import AutoProcessor, BitsAndBytesConfig
 
-    cls = getattr(transformers, "Qwen3_5ForConditionalGeneration", None)
+    # 1. التعرف التلقائي على معمارية الموديل من ملف الإعدادات
+    arch_type = "qwen3_5"
+    cfg_path = Path(args.model) / "config.json"
+    if cfg_path.exists():
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            arch_type = cfg.get("model_type", "qwen3_5")
+        except Exception:
+            pass
+
+    if arch_type == "qwen2_5_vl":
+        cls_name = "Qwen2_5_VLForConditionalGeneration"
+    else:
+        cls_name = "Qwen3_5ForConditionalGeneration"
+
+    cls = getattr(transformers, cls_name, None)
     if cls is None:
         cls = getattr(transformers, "AutoModelForImageTextToText", None)
     if cls is None:
         print(json.dumps({"error": f"transformers {transformers.__version__} "
-                                   "cannot load Qwen3.5 (needs >=5.0)"}),
+                                   f"cannot load {cls_name} (needs >=5.0)"}),
               flush=True)
         sys.exit(1)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    dtype = torch.float16 if device == "cuda" else torch.float32
+
+    # 2. تطبيق إعدادات الحماية لكرت الشاشة والضغط 4-bit
+    kwargs = {
+        "trust_remote_code": True,
+        "low_cpu_mem_usage": True,
+    }
+
+    if device == "cuda":
+        kwargs["device_map"] = {"": 0}  # إجبار البقاء في كرت الشاشة لمنع خطأ الـ Offload
+        kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+            bnb_4bit_quant_type="nf4"
+        )
+    else:
+        kwargs["dtype"] = torch.float32
 
     processor = AutoProcessor.from_pretrained(args.model, trust_remote_code=True)
-    model = cls.from_pretrained(
-        args.model, dtype=dtype,
-        device_map="auto" if device == "cuda" else None,
-        trust_remote_code=True, low_cpu_mem_usage=True,
-    ).eval()
+    model = cls.from_pretrained(args.model, **kwargs).eval()
 
     try:
         from qwen_vl_utils import process_vision_info
