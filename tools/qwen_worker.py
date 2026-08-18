@@ -97,35 +97,29 @@ def inspect_model(model_dir: str) -> dict:
 def fit(img: Image.Image, arch: str) -> Image.Image:
     """Sizes the crop for the target architecture.
 
-    This is the ONLY place crops are resized. The engine deliberately sends
-    them untouched in subprocess mode -- fitting on both sides stacked two
-    resamples on the same glyphs.
+    This is the ONLY place crops are resized. The engine sends them untouched
+    in subprocess mode, so fitting happens exactly once.
+
+    qwen3_5 RESIZES to a multiple of 64 rather than padding to it. Padding is
+    the more principled choice -- resizing changes the aspect ratio, a 220x90
+    crop becoming 256x128 -- but it was measured and it lost: baseline 5/12
+    with resize, 3/12 with padding, on the same image. Two cells regressed
+    specifically (٦ -> 7, and ٥٫٩٥ -> "0,9 |"). Whatever the theory says, the
+    measurement rules. Do not reintroduce padding without a new measurement.
     """
     if max(img.size) > MAX_SIDE:
         img.thumbnail((MAX_SIDE, MAX_SIDE), Image.Resampling.LANCZOS)
 
     if arch != "qwen3_5":
+        # Qwen2.5-VL resizes internally on a 28px patch grid; anything here
+        # is a second resample stacked on the same glyphs.
         return img
 
     w, h = img.size
     nw = ((w + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
     nh = ((h + MULTIPLE - 1) // MULTIPLE) * MULTIPLE
-    if (nw, nh) == (w, h):
-        return img
-
-    # Pad, do not resize: resizing changes the aspect ratio (a 220x90 crop
-    # became 256x128, a 42% vertical stretch), which distorts digit shapes.
-    #
-    # Pad with the crop's OWN border colour, not pure white. After
-    # illumination normalisation the paper is light grey, not (255,255,255),
-    # so white padding draws a visible rectangle the model reads as a stroke.
-    edge = list(img.crop((0, 0, w, 1)).getdata())          # top row
-    edge += list(img.crop((0, h - 1, w, h)).getdata())     # bottom row
-    fill = tuple(sorted(c[i] for c in edge)[len(edge) // 2] for i in range(3))
-
-    canvas = Image.new("RGB", (nw, nh), fill)
-    canvas.paste(img, ((nw - w) // 2, (nh - h) // 2))
-    return canvas
+    return (img.resize((nw, nh), Image.Resampling.LANCZOS)
+            if (nw, nh) != (w, h) else img)
 
 
 # ------------------------------------------------------------------- loading
@@ -186,11 +180,18 @@ def load_model(model_dir: str, arch: str, quantized: bool,
         kwargs["device_map"] = {"": 0}
         dtype_label = "4bit (pinned to GPU 0)"
     else:
-        # bfloat16, not float16: both models are stored in BF16, which has a
-        # wider exponent range. Down-casting to FP16 can saturate large
-        # weights, and that shows up as changed output rather than an error --
-        # which would quietly invalidate accuracy comparisons.
-        dtype = torch.bfloat16 if device == "cuda" else torch.float32
+        # float32, not bfloat16. The 5/12 baseline was measured on CPU, where
+        # this branch picks float32; switching to bfloat16 on GPU coincided
+        # with a drop to 3/12 on the identical image, and the two regressed
+        # cells both look like precision artefacts -- ٥٫٩٥ came back as
+        # "0,9 |", the digit->Latin transliteration the prompt is supposed to
+        # suppress. float32 keeps the numerics that produced the good result
+        # while still running on the GPU.
+        #
+        # Cost: ~3.6 GB for a 0.9B model, which fits a 4 GB card only just.
+        # If this OOMs, bfloat16 is the fallback -- but measure before
+        # accepting it, because it is the change under suspicion.
+        dtype = torch.float32
         kwargs["dtype"] = dtype
         if device == "cuda":
             kwargs["device_map"] = {"": 0}

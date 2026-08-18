@@ -21,12 +21,13 @@ ocr:
     backend: subprocess
     worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
     worker_script: "tools/qwen_worker.py"
-    #model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
-    #arch: qwen3_5
-    model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
-    arch: qwen2_5_vl
 
-    max_new_tokens: 32
+    model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+    arch: qwen3_5
+    #model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
+    #arch: qwen2_5_vl
+    max_new_tokens: 64
+
 
     kind: any
 
@@ -34,20 +35,15 @@ ocr:
     upscale: 2
 
     column_kinds:
-      - {kind: number,      from: 0.000, to: 0.163}   # price
-      - {kind: number,      from: 0.163, to: 0.285}   # quantity
-      - {kind: arabic_text, from: 0.285, to: 0.775}   # description
-      - {kind: number,      from: 0.775, to: 0.940}   # total
-
+      - {kind: number,      from: 0.000, to: 0.163, role: price}
+      - {kind: number,      from: 0.163, to: 0.285, role: qty}
+      - {kind: arabic_text, from: 0.285, to: 0.775, role: desc}
+      - {kind: number,      from: 0.775, to: 0.940, role: total}
 
     split_on_columns: true
     min_split_width: 45
     split_inset: 10
     ignore_beyond_x: 0.94
-
-    max_new_tokens_by_kind:
-      number: 16
-      arabic_text: 32
 
     fill_missing_cells: true
     row_tolerance: 0.35
