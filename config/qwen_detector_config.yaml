@@ -30,25 +30,21 @@ preprocessing:
 
 flow:
   name: detector_driven
-
 ocr:
   detector:
     name: surya_detector
     params:
       min_side: 12
-      ignore_beyond_x: 0.94
+      ignore_beyond_x: 0.93
 
-  # The x-fraction column layout. Measured by hand on one printed form, and
-  # wrong the moment a page is cropped differently -- which is exactly why the
-  # layout-driven flow exists. Kept here because this flow has no grid to ask.
   refiner:
     name: column_fraction
     params:
       column_kinds:
-        - {kind: number,      from: 0.000, to: 0.163}
-        - {kind: number,      from: 0.163, to: 0.285}
-        - {kind: arabic_text, from: 0.285, to: 0.775}
-        - {kind: number,      from: 0.775, to: 0.940}
+        - { kind: number,      from: 0.000, to: 0.163, role: price }
+        - { kind: number,      from: 0.163, to: 0.285, role: qty }
+        - { kind: arabic_text, from: 0.285, to: 0.775, role: desc }
+        - { kind: number,      from: 0.775, to: 0.940, role: total }
       split_on_columns: true
       min_split_width: 45
       split_inset: 10
@@ -57,16 +53,18 @@ ocr:
 
   cropper:
     name: padded_crop
-    params: {pad: 10, upscale: 2, min_side: 8}
+    params: { pad: 10, upscale: 2, min_side: 8, min_ink_ratio: 0.029 }
 
   recognizer:
     name: qwen
     params:
       backend: subprocess
-      worker_python: "qwen_venv\\Scripts\\python.exe"
+      worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
       worker_script: "tools/qwen_worker.py"
-      model_path: "models\\qwen"
-      arch: qwen2_5_vl
+      model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+      #model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
+      # تم إيقاف المعمارية لتتوافق مع الموديل الحالي
+      #arch: qwen2_5_vl
       max_new_tokens: 64
       default_kind: any
 
