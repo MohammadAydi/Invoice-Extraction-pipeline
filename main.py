@@ -1,13 +1,17 @@
-"""Entry point / usage example for the backbone.
+"""Entry point / usage example for the pipeline, one image at a time.
 
-Wires everything from config/default_config.yaml and shows the intended
-call shape. Running this end to end will raise NotImplementedError once
-it reaches the first unfilled stub -- that's expected until each stage's
-real implementation is filled in by the team.
+This is the command-line path. The desktop app does not use it -- it talks to
+`api.main:app` over HTTP -- but both run the exact same PipelineOrchestrator
+from the exact same config file, which is what makes this the right place to
+reproduce a bad extraction outside the service.
+
+    python main.py bills/invoice_042.jpg
+    python main.py bills/invoice_042.jpg config/qwen_config.yaml
 """
 
 from __future__ import annotations
 
+import json
 import sys
 
 import cv2
@@ -17,16 +21,21 @@ from core.domain.image_payload import ImagePayload
 from orchestration.pipeline_orchestrator import PipelineOrchestrator
 
 
-def main(image_path: str, config_path: str = "config/default_config.yaml") -> None:
-    config = load_config(config_path) #load the config file
-    orchestrator = PipelineOrchestrator(config) # init pipeline
+def main(image_path: str, config_path: str = "config/qwen_config.yaml") -> None:
+    config = load_config(config_path)
+    orchestrator = PipelineOrchestrator(config)
 
-    raw = cv2.imread(image_path) # read
-    payload = ImagePayload(image=raw) #payload
+    raw = cv2.imread(image_path)
+    if raw is None:
+        sys.exit(f"Could not read image: {image_path}")
 
-    result = orchestrator.run(payload) # run the pipeline
-    print(result)
+    run = orchestrator.run(ImagePayload(image=raw))
+
+    print(json.dumps(run.output, ensure_ascii=False, indent=2))
+    print(f"\nResults written under: {orchestrator.result_store.output_dir}")
 
 
 if __name__ == "__main__":
-    main(sys.argv[1])
+    if len(sys.argv) < 2:
+        sys.exit("Usage: python main.py <image> [config.yaml]")
+    main(*sys.argv[1:3])

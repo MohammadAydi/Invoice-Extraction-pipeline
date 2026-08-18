@@ -1,0 +1,22 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./.venv/Scripts/python.exe -)",
+      "Bash(./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_api.py -q)",
+      "Bash(./.venv/Scripts/python.exe tools/render_layout.py data/raw --save-binary)",
+      "Bash(./.venv/Scripts/python.exe tools/render_layout.py data/raw/test3.jpg)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_table_extraction.py -q)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_layout_classifier.py -q)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_flows.py -q)",
+      "Bash(cp preprocessing/pipeline.py /tmp/pipeline.bak)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_coordinate_space.py -q)",
+      "Bash(cp /tmp/pipeline.bak preprocessing/pipeline.py)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_cell_mapper.py -q)",
+      "Bash(./.venv/Scripts/python.exe -m pytest)",
+      "Bash(grep -n '\\\\\\\\\\\\\\\\|' settings-config-contract.md)",
+      "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -c ' *)",
+      "Bash(./.venv/Scripts/python.exe -m pytest tests/test_invoice_parser.py -q)"
+    ]
+  }
+}

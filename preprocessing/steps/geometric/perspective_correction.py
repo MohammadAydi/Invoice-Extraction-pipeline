@@ -32,9 +32,26 @@ def _order_points(pts: np.ndarray) -> np.ndarray:
 class PerspectiveCorrectionStep:
     name = "perspective_correction"
 
-    def __init__(self, canny_low: int = 30, canny_high: int = 150, **params):
+    def __init__(
+        self,
+        canny_low: int = 30,
+        canny_high: int = 150,
+        min_area_ratio: float = 0.2,
+        **params,
+    ):
         self.canny_low = canny_low
         self.canny_high = canny_high
+
+        # The smallest fraction of the frame a detected quad may cover and still
+        # be believed to be the page. A real page edge fills most of the photo;
+        # anything much smaller is a paragraph, a stamp or a logo whose outline
+        # happened to be the largest closed contour. Warping to one of those
+        # throws the invoice away and leaves a thumbnail of a word behind --
+        # measured on a borderless receipt, a 1400x1000 page came out 37x57 --
+        # and nothing downstream can tell that it happened, because a cropped
+        # image is still a perfectly valid image.
+        self.min_area_ratio = min_area_ratio
+
         self.params = params
 
     def apply(self, ctx: PipelineContext) -> PipelineContext:
@@ -53,7 +70,14 @@ class PerspectiveCorrectionStep:
             edges_dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
         if not contours:
-            raise ValueError("No paper contour detected in image.")
+            # An evenly-lit scan with no visible page edge -- the paper fills the
+            # frame, so there is nothing to crop to. That is a perfectly good
+            # invoice, and failing here would fail the whole extraction over a
+            # step that simply had no work to do.
+            ctx.payload.metadata[self.name] = {
+                "skipped": "no page contour detected; image passed through unchanged"
+            }
+            return ctx
 
         paper_contour = max(contours, key=cv2.contourArea)
         rect = cv2.minAreaRect(paper_contour)
@@ -71,9 +95,29 @@ class PerspectiveCorrectionStep:
         max_height = int(max(height_a, height_b))
 
         if max_width <= 0 or max_height <= 0:
-            raise ValueError(
-                "Detected paper contour has zero width/height; cannot warp."
-            )
+            # A degenerate quad -- a single line or point of detected edge. Warping
+            # to it would destroy the page, so keep the original, same as when no
+            # contour was found at all.
+            ctx.payload.metadata[self.name] = {
+                "skipped": "detected page contour is degenerate; image passed through unchanged"
+            }
+            return ctx
+
+        source_height, source_width = image.shape[:2]
+        area_ratio = (max_width * max_height) / float(source_width * source_height)
+
+        if area_ratio < self.min_area_ratio:
+            # Not the page. See min_area_ratio in __init__ for why this guard has
+            # to exist: without it the step silently replaces the invoice with a
+            # crop of whatever had the strongest outline.
+            ctx.payload.metadata[self.name] = {
+                "skipped": (
+                    f"largest contour covers only {area_ratio:.1%} of the frame, "
+                    f"below the {self.min_area_ratio:.0%} floor; it is not the page edge"
+                ),
+                "rejected_area_ratio": area_ratio,
+            }
+            return ctx
 
         dst = np.array(
             [

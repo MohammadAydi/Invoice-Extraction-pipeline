@@ -27,6 +27,15 @@ PROMPTS = {
         "اكتب النص كما هو تماماً. قد تظهر أسماء ماركات أجنبية. "
         "إن كانت الخانة فارغة أو غير مقروءة فاكتب: EMPTY"
     ),
+    # A date is NOT a number. The "number" prompt above forbids every non-digit
+    # character, which strips the separators out of "٢٠٢٦/٨/١٥" and leaves an
+    # eight-digit run nothing downstream can parse back into a date.
+    "date": (
+        "هذه خانة من فاتورة، تحتوي تاريخاً مكتوباً بخط اليد. "
+        "اكتب التاريخ بالأرقام الإنجليزية 0-9 مع الفواصل كما تظهر "
+        "(مثال: 2026/8/15). لا تكتب أي حرف. "
+        "إن كانت الخانة فارغة أو غير مقروءة فاكتب: EMPTY"
+    ),
     "any": "اقرأ النص في هذه الصورة كاملاً من البداية إلى النهاية.",
 }
 
@@ -55,13 +64,13 @@ def fit_for_model(img: Image.Image) -> Image.Image:
 class QwenVLMEngine:
     def __init__(
         self,
-        model_path: str = r"D:\Arabic-Qwen3.5-OCR-v4",
+        model_path: str = r"models\qwen",
         backend: str = "http",
         host: str = "http://localhost:11434",
         model_name: str = "arabic-ocr",
         kind: str = "any",
         max_new_tokens: int = 64,
-        worker_python: str = r"D:\OCR\.venv_vlm\Scripts\python.exe",
+        worker_python: str = r"qwen_venv\Scripts\python.exe",
         worker_script: str = "tools/qwen_worker.py",
         **engine_params,
     ):

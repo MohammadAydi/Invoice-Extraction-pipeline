@@ -2,11 +2,11 @@ preprocessing:
   # Runs once. Output is the single image shown on both sides of the UI.
   geometric_steps:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
-    - {name: deskew, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10}}
+    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10}}
 
   ocr_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: illumination_normalization, enabled: true, params: {blur_kernel: 95}}
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
     - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
     - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
     - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
@@ -14,7 +14,10 @@ preprocessing:
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+    # invert: the table extractors reconstruct the grid by eroding the FOREGROUND,
+    # so they need ink at 255. Without it they get an ink-at-0 image and
+    # reconstruct the paper instead of the rules.
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 15, c: 10, invert: true}}
 
 ocr:
   engine: surya

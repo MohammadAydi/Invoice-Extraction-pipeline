@@ -1,44 +1,21 @@
+"""Line-based grid reconstruction helpers for `grid_line_extractor`.
+
+Three things used to live here and no longer do:
+
+* `estimate_skew_angle` / `deskew_image` -- a second copy of deskew, which the
+  extractor ran on an image the pipeline had ALREADY deskewed. That second
+  rotation put every table bbox in a different coordinate space from every OCR
+  bbox. Deskew now happens once, upstream, in
+  `preprocessing/steps/geometric/deskew.py`.
+* `build_line_mask` -- also duplicated in `temp/table_det.py`, now shared from
+  `morphology.py`.
+* `detect_table_grid` and its `__main__` block -- a standalone CLI that
+  re-implemented the extractor and wrote debug PNGs into the *parent* directory
+  as a side effect of being called. It is `tools/render_layout.py` now.
+"""
+
 import cv2
 import numpy as np
-
-
-def estimate_skew_angle(gray):
-    """Estimates the dominant tilt of the image using Hough line voting."""
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    edges = cv2.Canny(blurred, 50, 150, apertureSize=3)
-
-    raw_lines = cv2.HoughLinesP(
-        edges, 1, np.pi / 180, threshold=100, minLineLength=100, maxLineGap=15
-    )
-    if raw_lines is None:
-        return 0.0
-
-    angles = []
-    for line in raw_lines:
-        x1, y1, x2, y2 = line[0]
-        angle = np.arctan2(y2 - y1, x2 - x1) * 180 / np.pi
-        folded = angle % 90
-        if folded > 45:
-            folded -= 90
-        angles.append(folded)
-
-    return float(np.median(angles)) if angles else 0.0
-
-
-def deskew_image(img, angle):
-    (h, w) = img.shape[:2]
-    center = (w // 2, h // 2)
-    rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
-    cos = np.abs(rot_mat[0, 0])
-    sin = np.abs(rot_mat[0, 1])
-    new_w = int((h * sin) + (w * cos))
-    new_h = int((h * cos) + (w * sin))
-    rot_mat[0, 2] += (new_w / 2) - center[0]
-    rot_mat[1, 2] += (new_h / 2) - center[1]
-    return cv2.warpAffine(
-        img, rot_mat, (new_w, new_h),
-        flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE
-    )
 
 
 def extract_lines_from_mask(mask, is_horizontal, min_length=40, merge_gap=10):
@@ -118,41 +95,6 @@ def merge_close_lines(lines, is_horizontal, proximity_thresh=15):
         [(l[0], l[1], l[2], l[3]) for l in group], is_horizontal
     ))
     return merged
-
-
-def extract_cells(h_lines, v_lines, min_cell_size=10):
-    """
-    Builds cell rectangles directly from the grid lines. A cell is
-    simply the rectangle between two consecutive horizontal lines
-    (top/bottom) and two consecutive vertical lines (left/right) — no
-    span-merging logic, every grid position is its own cell.
-
-    Returns a flat list of dicts (matches the shape the rest of the
-    pipeline / your text-mapping step expects):
-        {"x1","y1","x2","y2","row","col","rowspan":1,"colspan":1}
-    """
-    if len(h_lines) < 2 or len(v_lines) < 2:
-        print("Not enough lines to form cells (need >=2 horizontal and >=2 vertical).")
-        return []
-
-    y_positions = sorted(set(int((l[1] + l[3]) / 2) for l in h_lines))
-    x_positions = sorted(set(int((l[0] + l[2]) / 2) for l in v_lines))
-
-    cells = []
-    for r in range(len(y_positions) - 1):
-        y1, y2 = y_positions[r], y_positions[r + 1]
-        if (y2 - y1) < min_cell_size:
-            continue
-        for c in range(len(x_positions) - 1):
-            x1, x2 = x_positions[c], x_positions[c + 1]
-            if (x2 - x1) < min_cell_size:
-                continue
-            cells.append({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "row": r, "col": c, "rowspan": 1, "colspan": 1,
-            })
-
-    return cells
 
 
 def _segment_has_line(mask, is_vertical_separator, pos, range_start, range_end,
@@ -325,25 +267,6 @@ def extract_cells_with_spans(h_lines, v_lines, vertical_mask, horizontal_mask,
     return merged
 
 
-def draw_cells(img, cells, result_path="cells_detected.png"):
-    """Draws every (possibly spanning) cell rectangle for visual review,
-    and labels colspan/rowspan when >1. Does NOT crop or save individual
-    cell images — cells are returned as coordinates only, meant to be
-    matched against text-detection boxes from your separate OCR model."""
-    output = img.copy()
-
-    for cell in cells:
-        x1, y1, x2, y2 = cell["x1"], cell["y1"], cell["x2"], cell["y2"]
-        cv2.rectangle(output, (x1, y1), (x2, y2), (0, 255, 0), 2)
-        if cell["rowspan"] > 1 or cell["colspan"] > 1:
-            label = f'{cell["rowspan"]}x{cell["colspan"]}'
-            cv2.putText(output, label, (x1 + 4, y1 + 18),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 140, 255), 2)
-
-    cv2.imwrite(result_path, output)
-    print(f"Extracted {len(cells)} cells (spanning-aware). Saved preview to: {result_path}")
-
-
 def filter_by_intersection(h_lines, v_lines, tolerance=15):
     """
     Keeps only lines that actually intersect at least one line of the
@@ -363,140 +286,3 @@ def filter_by_intersection(h_lines, v_lines, tolerance=15):
     kept_h = [h for h in h_lines if any(intersects(h, v, tolerance) for v in v_lines)]
     kept_v = [v for v in v_lines if any(intersects(h, v, tolerance) for h in h_lines)]
     return kept_h, kept_v
-
-
-def build_line_mask(binary, is_horizontal, w, h,
-                     dot_bridge_scale=150, main_kernel_scale=30):
-    """
-    Two-stage reconstruction so it works for BOTH solid lines and
-    dotted/dashed lines made of small separated marks:
-
-    Stage 1 (dot bridging): a SHORT dilation along the line's direction
-    merges nearby dots/dashes into one continuous stroke. Without this
-    stage, erosion in stage 2 would just erase isolated dots since they
-    are smaller than the main kernel.
-
-    Stage 2 (main reconstruction): the same erode->dilate with a long
-    kernel as before, which now works because the input is continuous.
-    """
-    if is_horizontal:
-        bridge_len = max(3, w // dot_bridge_scale)
-        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (bridge_len, 1))
-    else:
-        bridge_len = max(3, h // dot_bridge_scale)
-        bridge_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, bridge_len))
-
-    # Stage 1: bridge dots/dashes into continuous strokes
-    bridged = cv2.dilate(binary, bridge_kernel, iterations=1)
-
-    # Stage 2: standard long-kernel reconstruction (also keeps already-solid lines)
-    if is_horizontal:
-        main_len = max(10, w // main_kernel_scale)
-        main_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (main_len, 1))
-    else:
-        main_len = max(10, h // main_kernel_scale)
-        main_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, main_len))
-
-    eroded = cv2.erode(bridged, main_kernel, iterations=1)
-    result = cv2.dilate(eroded, main_kernel, iterations=1)
-    return result
-
-
-def detect_table_grid(
-    image_path,
-    result_path="grid_detected.png",
-    dot_bridge_scale=150,   # smaller = bridges bigger gaps between dots (150 -> ~image_width/150 px bridge)
-    main_kernel_scale=30,   # smaller = requires shorter runs to count as a "line"
-    min_line_length_ratio=0.05,
-    intersection_tolerance=15,  # px tolerance when checking if two lines actually meet
-    merge_proximity=15,  # px: lines closer than this (same orientation) get merged into one
-    min_extend_length_ratio=0.5,  # a line must already cover this fraction of the table's width/height to be trusted and extended; shorter ones are dropped as noise
-):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise FileNotFoundError(f"Could not load image from {image_path}")
-
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    skew_angle = estimate_skew_angle(gray)
-    print(f"Estimated skew angle: {skew_angle:.2f} degrees")
-    if abs(skew_angle) > 0.1:
-        img = deskew_image(img, skew_angle)
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-    h, w = gray.shape[:2]
-
-    binary = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 15, 10
-    )
-
-    # NEW: dot-bridging stage happens inside build_line_mask now, so
-    # this single call handles solid lines AND dotted/dashed lines.
-    horizontal_mask = build_line_mask(
-        binary, is_horizontal=True, w=w, h=h,
-        dot_bridge_scale=dot_bridge_scale, main_kernel_scale=main_kernel_scale
-    )
-    vertical_mask = build_line_mask(
-        binary, is_horizontal=False, w=w, h=h,
-        dot_bridge_scale=dot_bridge_scale, main_kernel_scale=main_kernel_scale
-    )
-
-    min_len_h = int(w * min_line_length_ratio)
-    min_len_v = int(h * min_line_length_ratio)
-
-    clean_horizontals = extract_lines_from_mask(horizontal_mask, True, min_length=min_len_h)
-    clean_verticals = extract_lines_from_mask(vertical_mask, False, min_length=min_len_v)
-
-    # Step A: merge nearby parallel lines that are really the same
-    # physical table line (duplicate/split detections)
-    clean_horizontals = merge_close_lines(clean_horizontals, is_horizontal=True,
-                                           proximity_thresh=merge_proximity)
-    clean_verticals = merge_close_lines(clean_verticals, is_horizontal=False,
-                                         proximity_thresh=merge_proximity)
-
-    # Step B: keep only lines that intersect at least one line of the
-    # opposite orientation — real grid lines always meet each other;
-    # stray detections (page edges, isolated marks, leftover noise) don't.
-    clean_horizontals, clean_verticals = filter_by_intersection(
-        clean_horizontals, clean_verticals, tolerance=intersection_tolerance
-    )
-
-    # Step C: extend every line to the table's outer bounds so a
-    # partially-detected line (e.g. only reaching 3/4 of the way across)
-    # doesn't get mistaken for "no separator here" and cause a false
-    # spanning-cell merge.
-    clean_horizontals, clean_verticals = extend_lines_to_table_bounds(
-        clean_horizontals, clean_verticals, min_extend_length_ratio=min_extend_length_ratio
-    )
-
-    grid_mask = cv2.bitwise_or(horizontal_mask, vertical_mask)
-
-    output_img = img.copy()
-    for x1, y1, x2, y2 in clean_horizontals:
-        cv2.line(output_img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-    for x1, y1, x2, y2 in clean_verticals:
-        cv2.line(output_img, (x1, y1), (x2, y2), (255, 0, 0), 2)
-
-    cv2.imwrite(result_path, output_img)
-    cv2.imwrite("../grid_mask_debug.png", grid_mask)
-    cv2.imwrite("../binary_debug.png", binary)
-
-    print("Successfully processed image!")
-    print(f"Saved visualization map to: {result_path}")
-    print(f"Detected {len(clean_horizontals)} horizontal lines, {len(clean_verticals)} vertical lines")
-
-    # Build cells directly from the cleaned + extended grid — every grid
-    # position is its own cell, no span-merging. No cropping — cells are
-    # returned as coordinates only, for mapping against your separate
-    # text-detection model's output boxes.
-    cells = extract_cells(clean_horizontals, clean_verticals)
-    draw_cells(img, cells, result_path="../cells_detected.png")
-
-    return clean_horizontals, clean_verticals, cells
-
-
-if __name__ == "__main__":
-    try:
-        horiz, vert, cells = detect_table_grid("./temp/ty1.jpg")
-    except Exception as e:
-        print(f"Error: {e}")

@@ -41,10 +41,16 @@ class FileResultStore:
         data = json.loads(path.read_text(encoding="utf-8"))
         elements = [self._matched_element_from_dict(raw) for raw in data["elements"]]
 
+        # The invoice view is deliberately not rebuilt: it is derived from the
+        # elements and the request's catalogs, and a reload has neither the
+        # catalogs nor a reason to re-match against a catalog that has moved on
+        # since. Callers that need it re-run the parse.
         return PipelineResult(
             invoice_id=data["invoice_id"],
             display_image_path=data["display_image_path"],
             elements=elements,
+            raw_text=data.get("raw_text", ""),
+            ocr_engine=data.get("ocr_engine", ""),
             config_snapshot=data["config_snapshot"],
             created_at=datetime.fromisoformat(data["created_at"]),
             pipeline_version=data["pipeline_version"],

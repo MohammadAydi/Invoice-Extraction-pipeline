@@ -9,78 +9,72 @@ import numpy as np
 from core.domain.geometry import BoundingBox
 from core.domain.image_payload import ImagePayload
 from core.domain.table import TableCell, TableExtractionResult, TableStructure
+from table_extraction.extractors.binary_input import require_binary_ink_white
 from table_extraction.extractors.grid_utils import (
-    build_line_mask,
-    detect_table_grid,
-    draw_cells,
-    estimate_skew_angle,
-    deskew_image,
     extract_cells_with_spans,
     extend_lines_to_table_bounds,
     extract_lines_from_mask,
     filter_by_intersection,
     merge_close_lines,
 )
+from table_extraction.extractors.morphology import build_line_mask
 from table_extraction.registry import extractor_registry
 
 
 @extractor_registry.register("grid_line")
 class GridLineTableExtractor:
+    """Ruled-line table extractor: morphological line reconstruction, then
+    intersect the surviving lines into a cell grid, span-aware.
+
+    Contrast with `contour_based`, which takes the closed regions directly. This
+    one is the better choice when the rules are clean and complete, since it
+    recovers the exact grid topology (including spans); `contour_based` copes
+    better with broken rules and with handwriting crossing them.
+
+    It does no preprocessing of its own -- see `binary_input.py` for why that
+    matters.
     """
-    Ruled-line table extractor using morphological line detection +
-    spanning-cell awareness. Wraps detect_table_grid from grid_utils.
-    """
+
+    name = "grid_line"
 
     def __init__(
         self,
         dot_bridge_scale: int = 150,
         main_kernel_scale: int = 30,
+        use_dot_bridging: bool = True,
         min_line_length_ratio: float = 0.05,
         intersection_tolerance: int = 15,
         merge_proximity: int = 15,
         min_extend_length_ratio: float = 0.5,
         coverage_ratio: float = 0.5,
-        save_debug_images: bool = False,
         **extractor_params,
     ):
         self.dot_bridge_scale = dot_bridge_scale
         self.main_kernel_scale = main_kernel_scale
+        self.use_dot_bridging = use_dot_bridging
         self.min_line_length_ratio = min_line_length_ratio
         self.intersection_tolerance = intersection_tolerance
         self.merge_proximity = merge_proximity
         self.min_extend_length_ratio = min_extend_length_ratio
         self.coverage_ratio = coverage_ratio
-        self.save_debug_images = save_debug_images
+        self.extractor_params = extractor_params
 
     def extract(self, image: ImagePayload) -> TableExtractionResult:
-        img = image.image  # numpy BGR array
-
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        h, w = gray.shape[:2]
-
-        # --- deskew (reuse pipeline's skew estimate) ---
-        skew = estimate_skew_angle(gray)
-        if abs(skew) > 0.1:
-            img = deskew_image(img, skew)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            h, w = gray.shape[:2]
-
-        binary = cv2.adaptiveThreshold(
-            gray, 255,
-            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 15, 10,
-        )
+        binary = require_binary_ink_white(image, self.name)
+        h, w = binary.shape[:2]
 
         # --- line detection ---
         h_mask = build_line_mask(
             binary, is_horizontal=True, w=w, h=h,
             dot_bridge_scale=self.dot_bridge_scale,
             main_kernel_scale=self.main_kernel_scale,
+            use_dot_bridging=self.use_dot_bridging,
         )
         v_mask = build_line_mask(
             binary, is_horizontal=False, w=w, h=h,
             dot_bridge_scale=self.dot_bridge_scale,
             main_kernel_scale=self.main_kernel_scale,
+            use_dot_bridging=self.use_dot_bridging,
         )
 
         min_len_h = int(w * self.min_line_length_ratio)
@@ -108,13 +102,10 @@ class GridLineTableExtractor:
             coverage_ratio=self.coverage_ratio,
         )
 
-        if self.save_debug_images:
-            draw_cells(img, raw_cells, result_path="cells_detected.png")
-
         # --- convert to domain objects ---
         if not raw_cells:
             return TableExtractionResult(
-                tables=[], extractor_name="grid_line", raw_extractor_output=raw_cells
+                tables=[], extractor_name=self.name, raw_extractor_output=raw_cells
             )
 
         # Compute the table's outer bounding box from the union of all cells
@@ -135,6 +126,11 @@ class GridLineTableExtractor:
                 row=c["row"],
                 col=c["col"],
                 table_id=table_id,
+                # Spans were computed and then dropped on the floor. A totals
+                # row with no vertical dividers is one wide cell, and saying so
+                # is what stops the mapper treating it as several narrow ones.
+                row_span=c.get("rowspan", 1),
+                col_span=c.get("colspan", 1),
             )
             for c in raw_cells
         ]
@@ -147,6 +143,6 @@ class GridLineTableExtractor:
 
         return TableExtractionResult(
             tables=[table],
-            extractor_name="grid_line",
+            extractor_name=self.name,
             raw_extractor_output=raw_cells,
         )

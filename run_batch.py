@@ -60,10 +60,11 @@ def main():
             raw = cv2.imread(str(img_path))
             if raw is None:
                 raise FileNotFoundError(f"cv2.imread returned None: {img_path}")
-            result = orchestrator.run(ImagePayload(image=raw))
-            n = len(getattr(result, "elements", []) or [])
-            print(f"    ok — invoice_id={getattr(result, 'invoice_id', '?')} "
-                  f"elements={n}")
+            run = orchestrator.run(ImagePayload(image=raw))
+            invoice = run.result.invoice
+            print(f"    ok — invoice_id={run.result.invoice_id} "
+                  f"elements={len(run.result.elements)} "
+                  f"line_items={len(invoice.line_items) if invoice else 0}")
         except Exception as exc:                          # noqa: BLE001
             # One bad invoice must not abort the batch.
             print(f"    !! FAILED: {exc}")
