@@ -21,9 +21,9 @@ ocr:
     backend: subprocess
     worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
     worker_script: "tools/qwen_worker.py"
-    #model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
-    model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
-    arch: qwen2_5_vl
+    model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
+    #model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
+    #arch: qwen2_5_vl
     max_new_tokens: 64
 
 

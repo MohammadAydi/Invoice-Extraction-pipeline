@@ -1,23 +1,4 @@
 # ocr/engines/hybrid_surya_qwen_engine.py
-"""Surya locates the fields, Qwen reads each one.
-
-Rationale, measured on this project's sample invoice:
-
-  * Surya's own recognition on the full page produced Chinese glyphs and LaTeX
-    for handwritten Arabic. Its *detector*, however, placed boxes correctly.
-  * Qwen read the same page poorly too, but read individual field crops far
-    better, and the per-column prompt suppressed the digit->Latin confusion
-    (٥->O, ٧->V, ٨->A) entirely.
-
-So: keep Surya's detector, throw away its recognizer, and hand each crop to
-Qwen. This class implements OCREngine, so PipelineOrchestrator needs no change
--- it is selected purely from config.
-
-Known limit worth stating plainly: the detector misses short isolated digits.
-On the sample, quantities of one or two characters were never boxed, so they
-never reach Qwen at all. Lowering DETECTOR_TEXT_THRESHOLD in local.env helps;
-verify per-form rather than assuming.
-"""
 
 from __future__ import annotations
 
@@ -27,7 +8,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-import numpy as np
 from PIL import Image
 
 from surya.detection import DetectionPredictor
@@ -42,30 +22,27 @@ from ocr.registry import engine_registry
 @engine_registry.register("surya_qwen")
 class HybridSuryaQwenEngine:
     def __init__(
-        self,
-        pad: int = 12,
-        upscale: int = 2,
-        min_side: int = 12,
-        column_kinds: list | None = None,
-        split_on_columns: bool = True,
-        min_split_width: int = 45,
-        split_inset: int = 10,
-        ignore_beyond_x: float | None = None,
-        fill_missing_cells: bool = True,
-        row_tolerance: float = 0.35,
-        debug_dir: str | None = "det",
-        **engine_params,
+            self,
+            pad: int = 12,
+            upscale: int = 2,
+            min_side: int = 12,
+            column_kinds: list | None = None,
+            split_on_columns: bool = True,
+            min_split_width: int = 45,
+            split_inset: int = 10,
+            ignore_beyond_x: float | None = None,
+            fill_missing_cells: bool = True,
+            row_tolerance: float = 0.35,
+            debug_dir: str | None = "det",
+            **engine_params,
     ):
         self.det_predictor = DetectionPredictor()
         self.reader = QwenVLMEngine(**engine_params)
-        # Where to dump each crop plus a per-page JSON/CSV of what was read.
-        # Set to null in config to turn off. Invaluable while tuning: it is the
-        # only way to see WHICH crop produced a given string.
         self.debug_dir = Path(debug_dir) if debug_dir else None
         self._page_counter = 0
-        self.pad = pad              # Surya crops tight; give the glyphs room
-        self.upscale = upscale      # small crops read better enlarged
-        self.min_side = min_side    # ignore specks
+        self.pad = pad
+        self.upscale = upscale
+        self.min_side = min_side
         self.split_on_columns = split_on_columns
         self.min_split_width = min_split_width
         self.split_inset = split_inset
@@ -121,7 +98,6 @@ class HybridSuryaQwenEngine:
         return boxes + added
 
     def _boundaries(self, width: int):
-        """Interior column boundaries, in pixels, sorted."""
         edges = set()
         for c in self.column_kinds:
             for frac in (c["from"], c["to"]):
@@ -129,9 +105,14 @@ class HybridSuryaQwenEngine:
                     edges.add(int(round(frac * width)))
         return sorted(edges)
 
-    def _split_box(self, x1, y1, x2, y2, width):
+    def _split_box(self, x1, y1, x2, y2, width, height):
         if not self.split_on_columns or not self.column_kinds:
             return [(x1, y1, x2, y2)]
+
+        center_y = (y1 + y2) / 2
+        if center_y < height * 0.20 or center_y > height * 0.80:
+            return [(x1, y1, x2, y2)]
+
         m = self.min_split_width
         cuts = [b for b in self._boundaries(width) if x1 + m < b < x2 - m]
         if not cuts:
@@ -146,6 +127,7 @@ class HybridSuryaQwenEngine:
                     parts.append((left, y1, right, y2))
             prev = b
         return parts or [(x1, y1, x2, y2)]
+
     def _kind_for(self, x_center: float, width: int) -> str:
         if not self.column_kinds:
             return self.reader.kind
@@ -185,11 +167,11 @@ class HybridSuryaQwenEngine:
             if (self.ignore_beyond_x is not None
                     and (bx1 + bx2) / 2 > self.ignore_beyond_x * w):
                 continue
-            for part in self._split_box(bx1, by1, bx2, by2, w):
+            # تمرير الارتفاع (h) للدالة لحماية الترويسة والتذييل
+            for part in self._split_box(bx1, by1, bx2, by2, w, h):
                 raw_boxes.append((part, box))
 
         raw_boxes = self._fill_missing(raw_boxes, w)
-        # Reading order: top to bottom, then right to left.
         raw_boxes.sort(key=lambda t: (round(t[0][1] / 20), -t[0][0]))
 
         ocr_start = time.perf_counter()
@@ -206,12 +188,16 @@ class HybridSuryaQwenEngine:
 
             kind = self._kind_for((x1 + x2) / 2, w)
             crop_start = time.perf_counter()
-            try:
-                text = self.reader.read(crop, kind=kind)
-            except Exception as exc:                      # noqa: BLE001
-                # One unreadable field must not abort a whole invoice.
+
+            if box is None:
                 text = ""
-                print(f"[surya_qwen] crop at {(x1, y1, x2, y2)} failed: {exc}")
+            else:
+                try:
+                    text = self.reader.read(crop, kind=kind)
+                except Exception as exc:
+                    text = ""
+                    print(f"[surya_qwen] crop at {(x1, y1, x2, y2)} failed: {exc}")
+
             crop_time = time.perf_counter() - crop_start
 
             if text.strip().upper() == "EMPTY":
@@ -223,8 +209,6 @@ class HybridSuryaQwenEngine:
             fragments.append(OCRFragment(
                 text=text,
                 bbox=BoundingBox(x=x1, y=y1, w=x2 - x1, h=y2 - y1),
-                # Detector confidence, not recognition confidence. The VLM
-                # does not expose a score, so do not invent one.
                 confidence=getattr(box, "confidence", None) if box is not None else None,
             ))
 
@@ -272,12 +256,7 @@ class HybridSuryaQwenEngine:
         )
 
     def _save_overlay(self, out_dir: Path, page, rows):
-        """Draw every detected box, numbered to match its crop filename.
 
-        This replaces what `surya_detect --images` used to produce, and adds
-        the numbering: without it there is no way to tell which box produced
-        which string in results.csv.
-        """
         from PIL import ImageDraw
 
         canvas = page.convert("RGB").copy()

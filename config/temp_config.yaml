@@ -13,7 +13,6 @@ preprocessing:
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    # تم التعطيل: لمنع ظهور النقاط السوداء (الضوضاء) التي استنزفت 10 ثوانٍ في هلوسات فارغة
     - {name: adaptive_threshold, enabled: false, params: {block_size: 25, c: 35}}
 
 ocr:
@@ -26,23 +25,21 @@ ocr:
     max_new_tokens: 64
 
     kind: any
-
     pad: 10
     upscale: 2
 
     column_kinds:
-      - {kind: arabic_text, from: 0.000, to: 0.270}   # ملاحظات
-      - {kind: number,      from: 0.270, to: 0.430}   # السعر الإجمالي
-      - {kind: number,      from: 0.430, to: 0.610}   # السعر الإفرادي
-      - {kind: number,      from: 0.610, to: 0.710}   # العدد
-      - {kind: arabic_text, from: 0.710, to: 0.960}   # اسم المنتج
-
+      - { kind: arabic_text, from: 0.000, to: 0.270, role: notes }
+      - { kind: number,      from: 0.270, to: 0.430, role: total }
+      - { kind: number,      from: 0.430, to: 0.610, role: price }
+      - { kind: number,      from: 0.610, to: 0.710, role: qty }
+      - { kind: arabic_text, from: 0.710, to: 0.930, role: desc }
 
     split_on_columns: true
     min_split_width: 45
     split_inset: 10
 
-    ignore_beyond_x: 0.96
+    ignore_beyond_x: 0.93
 
     fill_missing_cells: true
     row_tolerance: 0.35

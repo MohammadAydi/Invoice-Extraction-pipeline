@@ -1,30 +1,4 @@
 # ocr/engines/qwen_vlm_engine.py
-"""Arabic-Qwen3.5-OCR-v4 as an OCREngine.
-
-This is a *recognition-only* model: it reads whatever is in the image it is
-handed and has no notion of layout. On a full invoice page it hallucinates
-(measured: Chinese glyphs and LaTeX on this project's sample). Feed it a single
-field crop instead — see HybridSuryaQwenEngine, which pairs Surya's detector
-with this engine.
-
-Three backends, chosen by `backend` in engine_params:
-
-  "subprocess"    RECOMMENDED. Spawns tools/qwen_worker.py using a second
-                  venv's python.exe, which has transformers>=5.0, and talks to
-                  it over stdin/stdout. Needs no server and no GGUF
-                  conversion; the HF safetensors are used as downloaded. The
-                  model loads once and is reused for the whole batch.
-
-  "http"          talks to a local Ollama / llama-server. Needs the model
-                  converted to GGUF and a server running on `host`.
-
-  "transformers"  loads the safetensors in-process. Requires transformers>=5.0,
-                  which CONFLICTS with surya-ocr 0.17.1, so this only works in
-                  a venv where Surya is absent.
-
-Every heavy import is deliberately lazy (inside __init__, not at module scope)
-so that merely importing this module never breaks the Surya-only environment.
-"""
 
 from __future__ import annotations
 
@@ -41,10 +15,6 @@ from core.domain.image_payload import ImagePayload
 from core.domain.ocr import OCRFragment, OCRResult
 from ocr.registry import engine_registry
 
-# Prompts are Arabic because the model was fine-tuned on Arabic instructions.
-# The "number" prompt exists because the model transliterates Arabic-Indic
-# digits into look-alike Latin letters: ٥->O, ٧->V, ٨->A. Naming the mapping
-# explicitly is what suppresses it.
 PROMPTS = {
     "number": (
         "هذه خانة من فاتورة، تحتوي رقماً مكتوباً بخط اليد بالأرقام الهندية "
@@ -169,12 +139,7 @@ class QwenVLMEngine:
             clean_up_tokenization_spaces=False)[0].strip()
 
     def _init_subprocess(self, engine_params):
-        """Spawn the worker in the OTHER venv and wait for it to load.
 
-        This is the backend that needs no server and no GGUF conversion: the
-        HF safetensors are used directly, just in a process where
-        transformers>=5.0 is installed.
-        """
         import atexit
         import subprocess
 
@@ -188,9 +153,6 @@ class QwenVLMEngine:
         cmd = [self.worker_python, self.worker_script,
                "--model", self.model_path,
                "--max-new-tokens", str(self.max_new_tokens)]
-        # PYTHONIOENCODING belts-and-braces with the worker's own
-        # reconfigure(): on Windows the child would otherwise inherit a cp125x
-        # console encoding and mangle every Arabic reply.
         env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUTF8="1")
         self._proc = subprocess.Popen(
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -200,11 +162,6 @@ class QwenVLMEngine:
         atexit.register(self._shutdown)
 
         print(f"[qwen] loading model in worker ({self.model_path}) ...")
-        # transformers prints assorted warnings to STDOUT during load (e.g.
-        # "[ERROR] `min_frames` is part of Qwen3VLVideoProcessorInitKwargs..."
-        # which is a harmless docstring check, not a failure). Skip every line
-        # until the worker's own READY sentinel, instead of treating the first
-        # line as the answer.
         noise = []
         while True:
             line = self._proc.stdout.readline()
@@ -225,7 +182,7 @@ class QwenVLMEngine:
             try:
                 self._proc.stdin.close()
                 self._proc.wait(timeout=10)
-            except Exception:                              # noqa: BLE001
+            except Exception:
                 self._proc.kill()
 
     def _read_subprocess(self, img: Image.Image, prompt: str) -> str:
@@ -237,8 +194,6 @@ class QwenVLMEngine:
                "prompt": prompt}
         self._proc.stdin.write(json.dumps(req, ensure_ascii=False) + "\n")
         self._proc.stdin.flush()
-        # Same defence as at startup: a stray transformers warning on stdout
-        # must not be parsed as the reply. Read until a line parses as JSON.
         while True:
             line = self._proc.stdout.readline()
             if not line:
@@ -284,9 +239,6 @@ class QwenVLMEngine:
         return self._read_http(img, prompt)
 
     def recognize(self, image: ImagePayload) -> OCRResult:
-        """Whole-image recognition. The model returns text with no coordinates,
-        so a single fragment spanning the full frame is the honest
-        representation — do not fabricate per-line boxes it never produced."""
         pil = to_pil(image.image)
         text = self.read(pil)
         h, w = image.image.shape[:2]
