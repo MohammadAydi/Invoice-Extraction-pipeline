@@ -27,6 +27,7 @@ from core.domain.catalog import Catalogs
 from invoice.parser import InvoiceParser
 from mapping.cell_mapper import CellMapper
 from orchestration.flows.factory import build_flow
+from orchestration.page_debug import PageDebugWriter
 from output.factory import build_output_formatter
 from persistence.file_result_store import FileResultStore
 from preprocessing.pipeline_builder import PreprocessingPipelineBuilder
@@ -73,6 +74,7 @@ class PipelineOrchestrator:
         # run, and in what order, is its decision -- see orchestration/flows/.
         self.flow = build_flow(config, self.cell_mapper, components=ocr_components)
 
+        self.debug_page_dir = config.debug_dir
         self.string_matcher = build_string_matcher(config.string_matching)
         self.output_formatter = build_output_formatter(config.output)
         self.invoice_parser = InvoiceParser()
@@ -175,7 +177,10 @@ class PipelineOrchestrator:
         #      configured flow. Which of them run in which order is the flow's
         #      decision and the only thing the three strategies disagree on;
         #      everything either side of this call is identical for all three.
-        outcome = self.flow.run(ocr_payload, table_payload)
+        page_debug = PageDebugWriter.for_run(
+            self.debug_page_dir if write_debug_images else None
+        )
+        outcome = self.flow.run(ocr_payload, table_payload, debug=page_debug)
         ocr_result = outcome.ocr_result
         structured_doc = outcome.document
 

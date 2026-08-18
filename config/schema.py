@@ -132,3 +132,5 @@ class AppConfig(BaseModel):
     # Defaulted so every configuration written before flows existed still loads
     # and still behaves exactly as it did.
     flow: FlowConfig = Field(default_factory=FlowConfig)
+
+    debug_dir: str | None = "det"

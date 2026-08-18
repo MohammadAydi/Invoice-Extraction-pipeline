@@ -60,14 +60,21 @@ class ExtractionFlow(ABC):
 
     name: str = "extraction_flow"
 
-    def __init__(self, table_extractor, layout_classifier, cell_mapper):
+    def __init__(self, table_extractor, layout_classifier, cell_mapper,
+                 debug_writer=None):
         self.table_extractor = table_extractor
         self.layout_classifier = layout_classifier
         self.cell_mapper = cell_mapper
+        self.debug_writer = debug_writer
 
     # -- the template ---------------------------------------------------
 
-    def run(self, ocr_payload: ImagePayload, table_payload: ImagePayload) -> FlowOutcome:
+    def run(
+        self,
+        ocr_payload: ImagePayload,
+        table_payload: ImagePayload,
+        debug=None,
+    ) -> FlowOutcome:
         timings: dict = {}
 
         started = time.perf_counter()
@@ -75,7 +82,7 @@ class ExtractionFlow(ABC):
         timings["layout_s"] = round(time.perf_counter() - started, 3)
 
         started = time.perf_counter()
-        ocr_result = self._read_text(ocr_payload, layout)
+        ocr_result = self._read_text(ocr_payload, layout, debug)
         timings["read_s"] = round(time.perf_counter() - started, 3)
 
         started = time.perf_counter()
@@ -94,19 +101,19 @@ class ExtractionFlow(ABC):
     # -- hooks ----------------------------------------------------------
 
     @abstractmethod
-    def _read_text(self, payload: ImagePayload, layout: InvoiceLayout) -> OCRResult:
-        """Produce the page's text fragments. The one step the flows disagree on."""
+    def _read_text(
+        self, payload: ImagePayload, layout: InvoiceLayout, debug=None
+    ) -> OCRResult:
+        """Produce the page's text fragments. The one step the flows disagree on.
+
+        Implementations pass `debug` straight through to `_crop_and_read`; they
+        never write anything themselves.
+        """
 
     def _analyze_layout(
         self, table_payload: ImagePayload
     ) -> tuple[InvoiceLayout, TableExtractionResult | None]:
-        """Detect the ruled boxes, then label them.
 
-        Shared by all three flows, because even the flows that do not *read*
-        from the grid still need it to map fragments onto cells. A failure here
-        degrades to an empty layout rather than failing the run: an unruled
-        receipt has no grid and is still a perfectly good invoice.
-        """
         height, width = table_payload.image.shape[:2]
 
         try:
@@ -134,6 +141,7 @@ class ExtractionFlow(ABC):
         regions: Sequence[TextRegion],
         engine_name: str,
         raw_output: object = None,
+        debug=None,
     ) -> OCRResult:
         """Crop every region and read it, one fragment per region.
 
@@ -150,7 +158,15 @@ class ExtractionFlow(ABC):
         crop_s = time.perf_counter() - started
 
         started = time.perf_counter()
-        texts = self.recognizer.read_all(crops)
+        if self.debug_writer is not None and hasattr(self.recognizer, "read"):
+            texts, read_times = [], []
+            for crop in crops:
+                t0 = time.perf_counter()
+                texts.append(self.recognizer.read(crop))
+                read_times.append(time.perf_counter() - t0)
+        else:
+            texts = self.recognizer.read_all(crops)
+            read_times = None
         read_s = time.perf_counter() - started
 
         if len(texts) != len(crops):
@@ -158,6 +174,16 @@ class ExtractionFlow(ABC):
                 f"{type(self.recognizer).__name__}.read_all returned {len(texts)} "
                 f"results for {len(crops)} crops; callers index one against the other."
             )
+
+        if self.debug_writer is not None:
+            try:
+                self.debug_writer.write(
+                    payload.image, crops, texts,
+                    engine_name=engine_name, read_times=read_times,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Debug output is never worth failing a run for.
+                logger.warning("Debug output failed (%s); continuing.", exc)
 
         fragments = [
             OCRFragment(
@@ -172,6 +198,8 @@ class ExtractionFlow(ABC):
             for crop, text in zip(crops, texts)
         ]
 
+        if debug is not None:
+            debug.write(payload.image, crops, texts)
         logger.info(
             "%s: %d region(s) -> %d crop(s) in %.2fs, read in %.2fs (%.3fs/crop)",
             self.name,

@@ -36,7 +36,9 @@ class SingleEngineFlow(ExtractionFlow):
             **config.flow.params,
         )
 
-    def _read_text(self, payload: ImagePayload, layout: InvoiceLayout) -> OCRResult:
+    def _read_text(
+        self, payload: ImagePayload, layout: InvoiceLayout, debug=None
+    ) -> OCRResult:
         return self.engine.recognize(payload)
 
     def components(self) -> list[object]:

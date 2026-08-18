@@ -59,7 +59,9 @@ class DetectorDrivenFlow(ExtractionFlow):
         self.cropper = cropper
         self.recognizer = recognizer
 
-    def _read_text(self, payload: ImagePayload, layout: InvoiceLayout) -> OCRResult:
+    def _read_text(
+        self, payload: ImagePayload, layout: InvoiceLayout, debug=None
+    ) -> OCRResult:
         height, width = payload.image.shape[:2]
 
         detection = self.detector.detect(payload)
@@ -74,6 +76,7 @@ class DetectorDrivenFlow(ExtractionFlow):
                 "detected": len(detection.regions),
                 "after_refine": len(regions),
             },
+            debug=debug
         )
 
     def _warnings(self, layout: InvoiceLayout, ocr_result: OCRResult) -> list[str]:

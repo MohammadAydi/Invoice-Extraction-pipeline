@@ -91,7 +91,9 @@ class LayoutDrivenFlow(ExtractionFlow):
             if self.read_printed_labels or region.role not in _SKIPPED_ROLES
         ]
 
-    def _read_text(self, payload: ImagePayload, layout: InvoiceLayout) -> OCRResult:
+    def _read_text(
+        self, payload: ImagePayload, layout: InvoiceLayout, debug=None
+    ) -> OCRResult:
         regions = self._regions(layout)
 
         return self._crop_and_read(
@@ -99,6 +101,7 @@ class LayoutDrivenFlow(ExtractionFlow):
             regions,
             engine_name=f"layout+{self.recognizer.name}",
             raw_output={"layout_source": layout.source, "regions": len(regions)},
+            debug=debug
         )
 
     def _warnings(self, layout: InvoiceLayout, ocr_result: OCRResult) -> list[str]:
