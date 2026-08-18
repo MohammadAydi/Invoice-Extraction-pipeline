@@ -31,6 +31,7 @@ from core.domain.ocr import TextRegion
 from core.domain.roles import ContentKind
 from ocr.refiners.registry import refiner_registry
 
+_HEADER_FOOTER_MARGIN = 0.20
 
 @refiner_registry.register("column_fraction")
 class ColumnFractionRefiner:
@@ -72,7 +73,7 @@ class ColumnFractionRefiner:
     ) -> list[TextRegion]:
         split: list[TextRegion] = []
         for region in regions:
-            for part in self._split(region, width):
+            for part in self._split(region, width, height):
                 split.append(part)
 
         filled = split + self._missing(split, width)
@@ -94,11 +95,16 @@ class ColumnFractionRefiner:
                     edges.add(int(round(frac * width)))
         return sorted(edges)
 
-    def _split(self, region: TextRegion, width: int) -> list[TextRegion]:
+    def _split(self, region: TextRegion, width: int, height: int) -> list[TextRegion]:
         box = region.bbox
         x1, x2 = box.x, box.x + box.w
 
         if not self.split_on_columns or not self.columns:
+            return [region]
+        center_y = box.y + box.h / 2.0
+        if center_y < height * _HEADER_FOOTER_MARGIN or center_y > height * (
+            1.0 - _HEADER_FOOTER_MARGIN
+        ):
             return [region]
 
         m = self.min_split_width
