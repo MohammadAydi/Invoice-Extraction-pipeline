@@ -184,3 +184,70 @@ class TestRoundTrip:
 
         assert set(dumped) == set(STEP_KEYS)
         assert len(GEOMETRIC_STEP_KEYS) + len(PHOTOMETRIC_STEP_KEYS) == 8
+
+
+class TestFlowSelection:
+    """Which reading strategy the request wants.
+
+    Added to the contract when the single monolithic OCR engine was split into
+    detector / cropper / recognizer. The C# side sends it inside `configuration`.
+    """
+
+    def test_a_configuration_without_a_flow_still_validates(self):
+        """A client written against the previous contract must keep working, and
+        must keep getting the behaviour it was written for."""
+        settings = PipelineSettings.model_validate(VALID)
+
+        assert settings.flow.name == "single_engine"
+        assert settings.to_app_config().flow.name == "single_engine"
+
+    def test_the_selected_flow_reaches_the_app_config(self):
+        payload = copy.deepcopy(VALID)
+        payload["flow"] = {"name": "layout_driven"}
+
+        assert PipelineSettings.model_validate(payload).to_app_config().flow.name == (
+            "layout_driven"
+        )
+
+    def test_the_flow_survives_a_round_trip(self):
+        original = load_config("config/qwen_config.yaml")
+
+        restored = PipelineSettings.from_app_config(original).to_app_config(
+            table_photometric_steps=original.preprocessing.table_photometric_steps
+        )
+
+        assert restored.flow == original.flow
+        assert restored.table_extraction == original.table_extraction
+
+
+class TestThresholdPolarity:
+    """`invert` selects THRESH_BINARY_INV.
+
+    Not a preference: morphological line reconstruction erodes the FOREGROUND,
+    so the table branch needs ink at 255 while an OCR engine wants ink at 0.
+    Without it the table branch could not produce the image its own extractor
+    needs, and the extractor re-thresholded the binarized page itself to get it.
+    """
+
+    def test_invert_passes_through_as_a_threshold_param(self):
+        payload = copy.deepcopy(VALID)
+        payload["preprocessing"]["thresholding"]["params"] = {
+            "block_size": 15,
+            "c": 10,
+            "invert": True,
+        }
+
+        config = PipelineSettings.model_validate(payload).to_app_config()
+        step = next(
+            s for s in config.preprocessing.ocr_photometric_steps
+            if s.name == "adaptive_threshold"
+        )
+
+        assert step.params["invert"] is True
+
+    def test_every_thresholding_algorithm_accepts_it(self):
+        from preprocessing.steps.registry import step_registry
+
+        for algorithm in ("fixed_threshold", "otsu_threshold", "adaptive_threshold"):
+            step = step_registry.create(algorithm, invert=True)
+            assert step.invert is True, algorithm

@@ -33,8 +33,8 @@ from api.service_settings import (
 from config.schema import AppConfig
 from core.domain.image_payload import ImagePayload
 from core.exceptions import ConfigurationError, StepExecutionError
-from invoice.parser import Catalogs
-from string_matching.catalog import NamedEntry
+from core.domain.catalog import Catalogs
+from core.domain.catalog import NamedEntry
 
 logger = logging.getLogger(__name__)
 
@@ -156,11 +156,15 @@ async def extract(
     # service default: a request selecting a different engine must not be
     # refused because the default one is unavailable.
     if not pool.is_ready(config):
+        # Named by flow, not by `ocr.engine`: under the two region-based flows
+        # there is no single engine and `ocr.engine` is not even set, so
+        # reporting it would say "engine 'None' is not ready".
         return error_response(
             503,
             ErrorCodes.ENGINE_NOT_READY,
-            f"The OCR engine '{config.ocr.engine}' is not ready. It may still be "
-            "loading, or its dependencies may not be installed.",
+            f"The '{config.flow.name}' pipeline is not ready "
+            f"({config.ocr.engine or 'detector/recognizer components'}). It may "
+            "still be loading, or its dependencies may not be installed.",
         )
 
     # --- run the pipeline ------------------------------------------------

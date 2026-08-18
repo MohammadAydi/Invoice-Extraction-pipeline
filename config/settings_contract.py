@@ -22,6 +22,7 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from config.schema import (
     AppConfig,
+    FlowConfig,
     OCRConfig,
     OutputConfig,
     PersistenceConfig,
@@ -138,6 +139,11 @@ class PipelineSettings(BaseModel):
     output: OutputConfig = Field(default_factory=lambda: OutputConfig(formatter="ui_overlay_json"))
     persistence: PersistenceConfig = Field(default_factory=PersistenceConfig)
 
+    # Which reading strategy runs. Defaulted, so a client written against the
+    # previous contract still sends a valid configuration and still gets the
+    # single-engine behaviour it was written for.
+    flow: FlowConfig = Field(default_factory=FlowConfig)
+
     def to_app_config(self, table_photometric_steps: list[StepConfig] | None = None) -> AppConfig:
         """Translate to the internal ordered-list shape the pipeline runs.
 
@@ -156,6 +162,7 @@ class PipelineSettings(BaseModel):
             string_matching=self.string_matching,
             output=self.output,
             persistence=self.persistence,
+            flow=self.flow,
         )
 
     def _to_step(self, key: str) -> StepConfig:
@@ -208,4 +215,5 @@ class PipelineSettings(BaseModel):
             string_matching=config.string_matching,
             output=config.output,
             persistence=config.persistence,
+            flow=config.flow,
         )

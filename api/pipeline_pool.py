@@ -1,16 +1,18 @@
 """Keeps built pipelines alive between requests.
 
 Constructing a `PipelineOrchestrator` builds preprocessing pipelines, a table
-extractor, a string matcher -- cheap -- and an OCR engine, which is not: the
-Surya and Qwen engines load model weights, roughly a minute each. Since every
+extractor, a layout classifier, a string matcher -- all cheap -- and whichever
+OCR components the configured flow needs, which are not: the Surya detector and
+the Qwen recognizer load model weights, roughly a minute each. Since every
 request may carry its own `configuration`, building an orchestrator per request
 would pay that cost per invoice.
 
 Two caches solve it:
 
-* **Engines**, keyed by the OCR section alone. A request that changes a
-  threshold block size gets a new orchestrator but the *same* engine object, so
-  the weights stay loaded.
+* **OCR components**, keyed by the OCR section and the flow name together --
+  the two things that decide which models get built. A request that changes a
+  threshold block size gets a new orchestrator but the *same* detector and
+  recognizer objects, so the weights stay loaded.
 * **Orchestrators**, keyed by the whole configuration, bounded and
   least-recently-used. In practice the desktop app sends one configuration for
   a whole batch, so the cache holds a single entry and every request after the
@@ -30,9 +32,9 @@ from pathlib import Path
 
 from api.service_settings import PROJECT_ROOT
 from config.loader import load_config
-from config.schema import AppConfig, OCRConfig
+from config.schema import AppConfig
 from config.settings_contract import PipelineSettings
-from ocr.factory import build_ocr_engine
+from orchestration.flows.components import OCRComponents, build_ocr_components
 from orchestration.pipeline_orchestrator import PipelineOrchestrator
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,7 @@ class PipelinePool:
         self.default_config: AppConfig = resolve_paths(load_config(config_path))
 
         self._lock = threading.Lock()
-        self._engines: dict[str, object] = {}
+        self._components: dict[str, OCRComponents] = {}
         self._orchestrators: "OrderedDict[str, PipelineOrchestrator]" = OrderedDict()
 
     # ------------------------------------------------------------------
@@ -97,33 +99,38 @@ class PipelinePool:
 
     @property
     def engine_name(self) -> str:
-        return self.default_config.ocr.engine
+        """What /health reports as the engine.
+
+        The flow answers this now, because under the two region-based flows
+        there is no single engine -- "surya_detector+qwen" is the honest name
+        and `ocr.engine` is not even set.
+        """
+        try:
+            return self.get(self.default_config).engine_name
+        except Exception:  # noqa: BLE001 - report the intent when it cannot be built
+            return self.default_config.ocr.engine or self.default_config.flow.name
 
     def is_ready(self, config: AppConfig | None = None) -> bool:
-        """Whether the engine `config` selects can serve a request right now.
+        """Whether what `config` selects can serve a request right now.
 
-        Defaults to the service's own configuration, which is what /health reports.
-        An extract request must pass the configuration it is actually going to
-        run: a request that selects the stub engine has no business being
-        refused because Tesseract is not installed.
+        Defaults to the service's own configuration, which is what /health
+        reports. An extract request must pass the configuration it is actually
+        going to run: a request that selects the stub engine has no business
+        being refused because Tesseract is not installed.
         """
-        ocr_config = (config or self.default_config).ocr
+        target = config or self.default_config
 
         try:
-            engine = self._engine_for(ocr_config)
+            return self.get(target).is_ready()
         except Exception:  # noqa: BLE001 - a missing dependency is "not ready"
-            logger.warning("OCR engine '%s' could not be built.", ocr_config.engine)
+            logger.warning(
+                "Flow '%s' could not be built for readiness check.", target.flow.name
+            )
             return False
 
-        probe = getattr(engine, "is_ready", None)
-        return bool(probe()) if callable(probe) else True
-
     def warmup(self) -> None:
-        """Build and warm the default engine, so readiness is not a guess."""
-        engine = self._engine_for(self.default_config.ocr)
-        warm = getattr(engine, "warmup", None)
-        if callable(warm):
-            warm()
+        """Build and warm the default flow, so readiness is not a guess."""
+        self.get(self.default_config).warmup()
 
     # ------------------------------------------------------------------
     # Lookup
@@ -143,8 +150,8 @@ class PipelinePool:
         # holding the lock through it would serialize every other request
         # behind a cache miss. The worst case is two threads building the same
         # orchestrator concurrently, which wastes work but stays correct.
-        engine = self._engine_for(config.ocr)
-        orchestrator = PipelineOrchestrator(config, ocr_engine=engine)
+        components = self._components_for(config)
+        orchestrator = PipelineOrchestrator(config, ocr_components=components)
 
         with self._lock:
             self._orchestrators[cache_key] = orchestrator
@@ -155,18 +162,24 @@ class PipelinePool:
 
         return orchestrator
 
-    def _engine_for(self, ocr_config: OCRConfig):
-        engine_key = _key(ocr_config)
+    def _components_for(self, config: AppConfig) -> OCRComponents:
+        """The built models for this configuration, shared across orchestrators.
+
+        Keyed on the OCR section AND the flow name: the same `ocr` block builds
+        different objects under different flows -- layout_driven deliberately
+        builds no detector at all -- so the flow has to be part of the identity.
+        """
+        components_key = _key({"ocr": config.ocr.model_dump(), "flow": config.flow.name})
 
         with self._lock:
-            engine = self._engines.get(engine_key)
-        if engine is not None:
-            return engine
+            components = self._components.get(components_key)
+        if components is not None:
+            return components
 
-        logger.info("Building OCR engine '%s'.", ocr_config.engine)
-        engine = build_ocr_engine(ocr_config)
+        logger.info("Building OCR components for flow '%s'.", config.flow.name)
+        components = build_ocr_components(config)
 
         with self._lock:
             # Another thread may have won the race; keep whichever landed first
             # so there is only ever one instance per OCR configuration.
-            return self._engines.setdefault(engine_key, engine)
+            return self._components.setdefault(components_key, components)

@@ -1,5 +1,11 @@
 """Importing this package self-registers every OCR engine that can be imported.
 
+`surya_qwen` used to live here. It did detection, box refinement, cropping,
+recognition and debug-artifact writing in one class, which is why none of the
+five could be swapped independently. It is now the `detector_driven` flow
+composed from `ocr/detectors/`, `ocr/refiners/`, `ocr/cropping/` and
+`ocr/recognizers/`.
+
 The heavy engines pull in optional dependencies -- surya-ocr, torch,
 transformers -- that a machine running only the light Tesseract path has no
 reason to install. Importing them unconditionally would make the whole service
@@ -23,7 +29,6 @@ _OPTIONAL_ENGINES = (
     ("easyocr_engine", "easyocr"),
     ("surya_engine", "surya-ocr"),
     ("qwen_vlm_engine", "transformers / torch"),
-    ("hybrid_surya_qwen_engine", "surya-ocr + transformers"),
 )
 
 for _module_name, _requirement in _OPTIONAL_ENGINES:

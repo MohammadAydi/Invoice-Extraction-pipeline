@@ -63,6 +63,11 @@ class UIOverlayFormatter:
         wire = {
             "id": element.id,
             "kind": element.kind,
+            # What the layout stage decided this box holds, and roughly where it
+            # sits. "unknown" when no classifier ran, which is the honest answer
+            # and what every configuration written before classification says.
+            "role": element.role.value,
+            "zone": element.zone.value,
             "bbox": [bbox.x, bbox.y, bbox.x + bbox.w, bbox.y + bbox.h],
             "raw_text": element.merged_text,
             "corrected_text": matched.match.corrected_text,
@@ -75,5 +80,7 @@ class UIOverlayFormatter:
             wire["table_id"] = element.table_id
             wire["row"] = element.row
             wire["col"] = element.col
+            wire["row_span"] = element.row_span
+            wire["col_span"] = element.col_span
 
         return wire

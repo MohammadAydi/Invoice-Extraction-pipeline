@@ -114,13 +114,81 @@ class TestDeskew:
         result = HoughDeskewStep().apply(context(blank()))
         assert result.payload.image.shape[:2] == (900, 700)
 
-    def test_ignores_lines_beyond_the_maximum_angle(self):
-        # Steep lines are page furniture, not text baselines; with max_angle_deg
-        # at 1° none of them qualify and the page is left alone.
+    def test_refuses_to_rotate_beyond_the_maximum_angle(self):
+        """The clamp applies to the median, not to each line.
+
+        It used to be per-line, which silently threw away every *vertical* rule
+        on a ruled invoice — half the available evidence. Now every segment
+        votes and the clamp guards the answer instead: with max_angle_deg at 1°
+        the measurement is rejected and the page is left exactly as it came in.
+        """
         page = blank(800, 800)
         for x in range(200, 600, 60):
             cv2.line(page, (x, 100), (x + 300, 700), (0, 0, 0), 3)
 
         result = HoughDeskewStep(max_angle_deg=1.0).apply(context(page))
+        meta = result.payload.metadata["deskew_hough"]
 
-        assert result.payload.metadata["deskew_hough"]["num_lines_used"] == 0
+        assert result.payload.image.shape[:2] == (800, 800)
+        assert "skipped" in meta
+        assert meta["num_lines_used"] > 0
+
+    def test_vertical_rules_vote_for_the_same_tilt(self):
+        """The reason folding exists.
+
+        A ruled invoice carries as many vertical rules as horizontal ones. The
+        old per-line filter discarded every one of them, so a form whose
+        verticals are the crisper feature was measured off whichever horizontals
+        happened to survive. Folding modulo 90 makes a vertical rule vote for
+        the tilt it actually describes.
+        """
+        page = blank(800, 800)
+        for x in range(200, 640, 60):
+            cv2.line(page, (x, 120), (x, 680), (0, 0, 0), 3)
+
+        rotated = cv2.warpAffine(
+            page,
+            cv2.getRotationMatrix2D((400, 400), -4.0, 1.0),
+            (800, 800),
+            borderValue=(255, 255, 255),
+        )
+
+        folded = HoughDeskewStep().apply(context(rotated))
+        assert 2.5 < folded.payload.metadata["deskew_hough"]["median_angle_deg"] < 5.5
+
+        # Without folding the same page yields nothing to measure at all.
+        unfolded = HoughDeskewStep(fold_to_90=False).apply(context(rotated))
+        assert unfolded.payload.metadata["deskew_hough"]["num_lines_used"] == 0
+
+    def test_expanding_the_canvas_keeps_the_corners(self):
+        """Rotating into the original frame clips the corners, and on a page
+        that fills the photo the clipped corner is where the table's outer rule
+        lives."""
+        page = blank(800, 600)
+        for y in range(150, 500, 50):
+            cv2.line(page, (60, y), (540, y), (0, 0, 0), 3)
+
+        rotated = cv2.warpAffine(
+            page,
+            cv2.getRotationMatrix2D((300, 400), -6.0, 1.0),
+            (600, 800),
+            borderValue=(255, 255, 255),
+        )
+
+        expanded = HoughDeskewStep().apply(context(rotated)).payload.image
+        clipped = HoughDeskewStep(expand_canvas=False).apply(context(rotated)).payload.image
+
+        assert expanded.shape[0] > clipped.shape[0]
+        assert expanded.shape[1] > clipped.shape[1]
+        assert clipped.shape[:2] == (800, 600)
+
+    def test_a_page_already_level_is_not_resampled(self):
+        """A sub-degree correction costs sharpness and buys nothing."""
+        page = blank(800, 800)
+        for y in range(200, 600, 60):
+            cv2.line(page, (100, y), (700, y), (0, 0, 0), 3)
+
+        result = HoughDeskewStep().apply(context(page))
+
+        assert np.array_equal(result.payload.image, page)
+        assert "skipped" in result.payload.metadata["deskew_hough"]

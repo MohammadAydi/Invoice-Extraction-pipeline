@@ -18,13 +18,13 @@ app's verification screen exists precisely because this stage cannot be perfect.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
-from typing import Iterable, Sequence
+from dataclasses import dataclass
+from typing import Iterable
 
-from core.domain.document import StructuredDocument, TableCellElement
+from core.domain.document import DocumentElement, StructuredDocument, TableCellElement
 from core.domain.geometry import BoundingBox
 from core.domain.ocr import OCRFragment, OCRResult
-from invoice.models import (
+from core.domain.invoice import (
     REVIEW_CONFIDENCE_THRESHOLD,
     ExtractedValue,
     InvoiceDraft,
@@ -33,14 +33,11 @@ from invoice.models import (
     InvoiceWarning,
     WarningCodes,
 )
-from invoice.text_lines import TextLine, Word, group_lines
+from core.domain.roles import CellRole
+from core.domain.text_lines import TextLine, Word
+from invoice.text_lines import group_lines
 from string_matching.algorithms import DEFAULT_TOP_K
-from string_matching.catalog import (
-    CatalogEntry,
-    match_city,
-    match_merchant,
-    match_product,
-)
+from string_matching.catalog import Catalogs, match_city, match_merchant, match_product
 from string_matching.normalization import (
     format_date,
     normalize_quantity,
@@ -72,27 +69,21 @@ _COLUMN_HEADER_HINTS = (
     "item", "description", "qty", "quantity", "price", "unit", "amount",
 )
 
+# The four roles that make up one line of the item table.
+_ITEM_ROLES = frozenset(
+    {
+        CellRole.PRODUCT_NAME,
+        CellRole.QUANTITY,
+        CellRole.UNIT_PRICE,
+        CellRole.LINE_TOTAL,
+    }
+)
+
 # Paper invoices round each line to two decimals, so a cent of slack is right.
 _ARITHMETIC_TOLERANCE = 0.01
 
 # Sum-of-lines vs stated total, which accumulates per-line rounding.
 _TOTAL_TOLERANCE = 0.05
-
-
-@dataclass
-class Catalogs:
-    """The match targets the desktop app sends with each request.
-
-    Empty lists are normal and simply disable matching for that field, leaving
-    the raw OCR text and an empty candidate array.
-    """
-
-    merchants: Sequence[CatalogEntry] = field(default_factory=list)
-    products: Sequence[CatalogEntry] = field(default_factory=list)
-    cities: Sequence[CatalogEntry] = field(default_factory=list)
-
-    # How many ranked alternatives each matched field carries back.
-    top_k: int = DEFAULT_TOP_K
 
 
 class InvoiceParser:
@@ -129,19 +120,200 @@ class InvoiceParser:
             else lines
         )
 
+        # A classified layout knows which box holds which field, so there is
+        # nothing to infer. The heuristics below stay for everything else -- a
+        # borderless receipt, or a supplier's form no classifier covers -- and
+        # fill any field the layout did not label.
         draft.header = self._parse_header(header_lines or lines, catalogs)
+        if document.has_roles:
+            self._apply_labelled_header(draft.header, document, catalogs)
 
         # The grid is the better source when there is one, but a degenerate
         # grid -- a couple of cells detected off a printed border, none of them
         # holding an item row -- must not cost the whole table. Falling back to
         # line grouping recovers the rows a borderless read would have found
         # anyway, and returning nothing is strictly worse than trying.
-        draft.line_items = self._items_from_cells(cells, catalogs) if cells else []
+        if document.has_roles:
+            draft.line_items = self._items_from_roles(cells, catalogs)
+        else:
+            draft.line_items = self._items_from_cells(cells, catalogs) if cells else []
+
         if not draft.line_items:
             draft.line_items = self._items_from_lines(lines, catalogs)
 
         _add_warnings(draft)
         return draft
+
+    # ------------------------------------------------------------------
+    # Header and items, when the layout labelled them
+    # ------------------------------------------------------------------
+
+    def _apply_labelled_header(
+        self, header: InvoiceHeader, document: StructuredDocument, catalogs: Catalogs
+    ) -> None:
+        """Overwrite header fields the layout identified by role.
+
+        Only fields the layout actually labelled *and* read are replaced. A
+        labelled but empty box means the classifier found the caption and the
+        recognizer found nothing in it -- and the heuristic guess, weak as it is,
+        beats a confidently-empty field.
+        """
+        for role, field_name in (
+            (CellRole.INVOICE_NUMBER, "invoice_number"),
+            (CellRole.INVOICE_DATE, "invoice_date"),
+            (CellRole.CITY, "city"),
+            (CellRole.MERCHANT_NAME, "merchant_name"),
+            (CellRole.TOTAL_AMOUNT, "total_amount"),
+            (CellRole.TOTAL_IN_FIGURES, "total_amount"),
+        ):
+            element = _best_by_role(document, role)
+            if element is None:
+                continue
+
+            value = self._value_for_role(role, element, catalogs)
+            if value is not None:
+                setattr(header, field_name, value)
+
+    def _value_for_role(
+        self, role: CellRole, element, catalogs: Catalogs
+    ) -> ExtractedValue | None:
+        """One labelled box, read as the field its role names."""
+        text = _strip_label(element.merged_text)
+        if not text:
+            return None
+
+        confidence = _cell_confidence([element]) if element.fragments else 0.0
+        bbox = element.bbox
+
+        if role is CellRole.MERCHANT_NAME:
+            return ExtractedValue.from_match(
+                match_merchant(text, catalogs.merchants, catalogs.top_k),
+                fallback_text=text,
+                confidence=confidence,
+                bbox=bbox,
+            )
+
+        if role is CellRole.CITY:
+            match = match_city(text, catalogs.cities, catalogs.top_k)
+            if not match.candidates:
+                return ExtractedValue(value=text, confidence=confidence, bbox=bbox)
+            return ExtractedValue.from_match(
+                match, fallback_text=text, confidence=confidence, bbox=bbox
+            )
+
+        if role is CellRole.INVOICE_DATE:
+            parsed = parse_date(text)
+            return ExtractedValue(
+                value=format_date(parsed) if parsed else text,
+                confidence=confidence,
+                raw=text if parsed else None,
+                bbox=bbox,
+            )
+
+        if role in (CellRole.TOTAL_AMOUNT, CellRole.TOTAL_IN_FIGURES):
+            value = parse_number_strict(text)
+            if value is None:
+                return None
+            return ExtractedValue(value=value, confidence=confidence, raw=text, bbox=bbox)
+
+        # Invoice number: keep it as the string it was printed as. Leading zeros
+        # are part of "00008" and parsing it as a number would eat them.
+        return ExtractedValue(value=text, confidence=confidence, bbox=bbox)
+
+    def _items_from_roles(
+        self, cells: list[TableCellElement], catalogs: Catalogs
+    ) -> list[InvoiceLineItem]:
+        """Line items straight off the labelled columns.
+
+        The column-assignment machinery below (`_assign_columns` and its
+        arithmetic-consistency search) exists precisely because nobody knew which
+        number was the quantity and which the price. When the layout says so,
+        none of that guessing is needed or wanted -- a row whose arithmetic does
+        not check out is a row with a misread digit, and reinterpreting its
+        columns to make the multiplication work would hide exactly the error the
+        verification screen exists to surface.
+        """
+        rows: dict[int, dict[CellRole, TableCellElement]] = {}
+        for cell in cells:
+            if cell.role in _ITEM_ROLES:
+                rows.setdefault(cell.row, {})[cell.role] = cell
+
+        items: list[InvoiceLineItem] = []
+        for row_key in sorted(rows):
+            row = rows[row_key]
+            item = self._item_from_roles(row, len(items), catalogs)
+            if item is not None:
+                items.append(item)
+
+        return items
+
+    def _item_from_roles(
+        self,
+        row: dict[CellRole, TableCellElement],
+        row_index: int,
+        catalogs: Catalogs,
+    ) -> InvoiceLineItem | None:
+        product = row.get(CellRole.PRODUCT_NAME)
+        product_text = _strip_label(product.merged_text) if product else ""
+
+        numbers = {
+            role: row[role]
+            for role in (CellRole.QUANTITY, CellRole.UNIT_PRICE, CellRole.LINE_TOTAL)
+            if role in row and _strip_label(row[role].merged_text)
+        }
+
+        # An entirely blank printed row is the rest of an unfilled form, not a
+        # line item. Every form has ten rows whether or not ten things were sold.
+        if not product_text and not numbers:
+            return None
+
+        item = InvoiceLineItem(row_index=row_index)
+
+        if product is not None and product_text:
+            item.product_name = ExtractedValue.from_match(
+                match_product(product_text, catalogs.products, catalogs.top_k),
+                fallback_text=product_text,
+                confidence=_cell_confidence([product]),
+                bbox=product.bbox,
+            )
+        elif product is not None:
+            item.product_name = ExtractedValue(bbox=product.bbox)
+
+        quantity = row.get(CellRole.QUANTITY)
+        if quantity is not None:
+            raw = _strip_label(quantity.merged_text)
+            value = normalize_quantity(raw) if raw else None
+            item.quantity = ExtractedValue(
+                value=value,
+                confidence=_cell_confidence([quantity]) if value is not None else 0.0,
+                raw=raw if value is not None and str(value) != raw else None,
+                bbox=quantity.bbox,
+            )
+
+        for role, attr in (
+            (CellRole.UNIT_PRICE, "unit_price"),
+            (CellRole.LINE_TOTAL, "total_price"),
+        ):
+            cell = row.get(role)
+            if cell is None:
+                continue
+            raw = _strip_label(cell.merged_text)
+            value = parse_number_strict(raw) if raw else None
+            setattr(
+                item,
+                attr,
+                ExtractedValue(
+                    value=round(float(value), 2) if value is not None else None,
+                    confidence=_cell_confidence([cell]) if value is not None else 0.0,
+                    raw=raw if value is not None else None,
+                    bbox=cell.bbox,
+                ),
+            )
+
+        item.arithmetic_ok = _arithmetic_ok(
+            item.quantity.value, item.unit_price.value, item.total_price.value
+        )
+        return item
 
     # ------------------------------------------------------------------
     # Header
@@ -531,6 +703,48 @@ def _extract_total(lines: list[TextLine]) -> ExtractedValue:
 
 def _table_top(cells: list[TableCellElement]) -> float | None:
     return min((cell.bbox.y for cell in cells), default=None)
+
+
+def _best_by_role(document: StructuredDocument, role: CellRole) -> DocumentElement | None:
+    """The element with this role that actually holds text.
+
+    A form can print the same role twice -- a caption box and a value box both
+    classified as the city, say -- and the one with ink in it is the value. Ties
+    go to the first, which is the topmost in document order.
+    """
+    candidates = document.with_role(role)
+    if not candidates:
+        return None
+
+    populated = [el for el in candidates if _strip_label(el.merged_text)]
+    return populated[0] if populated else candidates[0]
+
+
+def _strip_label(text: str) -> str:
+    """Drop a printed caption from the front of a value.
+
+    These forms print the caption *inside* the same ruled box as the value --
+    "المدينة : ريف دمشق" is one cell, not two -- so the recognizer reads both and
+    the caption has to come off before the value is matched against a catalog.
+    Split on the colon rather than on a keyword list: every caption on the form
+    ends in one, and matching keywords would need a second copy of them here.
+    """
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return ""
+
+    for separator in (":", "：", "؛"):
+        if separator in cleaned:
+            head, _, tail = cleaned.partition(separator)
+            # Only when there is something after it. "الاسم :" with an unread
+            # value must come back empty, not as the caption.
+            if tail.strip():
+                cleaned = tail
+            elif head.strip():
+                cleaned = ""
+            break
+
+    return cleaned.strip()
 
 
 def _is_column_header_row(row: list[TableCellElement]) -> bool:

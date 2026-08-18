@@ -5,13 +5,18 @@ from __future__ import annotations
 import pytest
 
 from core.domain.document import FreeFieldElement, StructuredDocument, TableCellElement
+from core.domain.roles import CellRole, Zone
 from core.domain.geometry import BoundingBox
 from core.domain.ocr import OCRFragment, OCRResult
 from core.domain.table import TableCell, TableExtractionResult, TableStructure
-from invoice.models import WarningCodes
-from invoice.parser import Catalogs, InvoiceParser
+from table_extraction.classifiers.passthrough_classifier import (
+    PassthroughLayoutClassifier,
+)
+from core.domain.invoice import WarningCodes
+from core.domain.catalog import Catalogs
+from invoice.parser import InvoiceParser
 from mapping.cell_mapper import CellMapper
-from string_matching.catalog import NamedEntry
+from core.domain.catalog import NamedEntry
 
 
 def fragment(text: str, x: int, y: int, w: int = 60, h: int = 20, confidence: float = 0.9):
@@ -22,6 +27,17 @@ def fragment(text: str, x: int, y: int, w: int = 60, h: int = 20, confidence: fl
 
 def ocr(*fragments: OCRFragment) -> OCRResult:
     return OCRResult(fragments=list(fragments), engine_name="test")
+
+
+def layout_of(table: TableExtractionResult):
+    """The unclassified layout a bare table produces.
+
+    CellMapper takes an InvoiceLayout now, because it maps the whole page --
+    header captions and totals strip included -- rather than only table cells.
+    `passthrough` is what turns a plain TableExtractionResult into one without
+    labelling anything, which is exactly the behaviour these tests assert.
+    """
+    return PassthroughLayoutClassifier().classify(table, (1000, 1000))
 
 
 def free_document(result: OCRResult) -> StructuredDocument:
@@ -317,7 +333,7 @@ class TestCellMapper:
             fragment("خارج", 10, 400, w=40, h=20),
         )
 
-        document = CellMapper().map(result, table)
+        document = CellMapper().map(result, layout_of(table))
 
         cells = [el for el in document.elements if isinstance(el, TableCellElement)]
         free = [el for el in document.elements if isinstance(el, FreeFieldElement)]
@@ -336,7 +352,7 @@ class TestCellMapper:
             extractor_name="test",
         )
 
-        document = CellMapper().map(ocr(), table)
+        document = CellMapper().map(ocr(), layout_of(table))
 
         # A cell the engine could not read still needs a box to click on.
         assert len(document.elements) == 1
@@ -345,7 +361,7 @@ class TestCellMapper:
     def test_no_table_makes_everything_a_free_field(self):
         result = ocr(fragment("سكر", 10, 10))
         document = CellMapper().map(
-            result, TableExtractionResult(tables=[], extractor_name="test")
+            result, layout_of(TableExtractionResult(tables=[], extractor_name="test"))
         )
 
         assert len(document.elements) == 1
@@ -374,3 +390,152 @@ class TestWarnings:
 
         assert draft.line_items == []
         assert any(w.code == WarningCodes.NO_LINE_ITEMS for w in draft.warnings)
+
+
+class TestLabelledLayout:
+    """Reading an invoice off a classified layout instead of guessing at one.
+
+    When the layout stage labelled the boxes, the header fields and the item
+    columns are known, and none of the keyword heuristics or the
+    arithmetic-consistency column search should run. Those exist precisely
+    because nobody knew which number was the quantity.
+    """
+
+    @staticmethod
+    def cell(id, x, y, text, role, row=0, col=0, w=200, h=50):
+        frag = OCRFragment(
+            text=text, bbox=BoundingBox(x=x, y=y, w=w, h=h), confidence=0.9
+        )
+        return TableCellElement(
+            id=id,
+            table_id="t1",
+            row=row,
+            col=col,
+            bbox=BoundingBox(x=x, y=y, w=w, h=h),
+            fragments=[frag] if text else [],
+            merged_text=text,
+            role=role,
+            zone=Zone.TABLE,
+        )
+
+    @staticmethod
+    def field(id, x, y, text, role):
+        frag = OCRFragment(
+            text=text, bbox=BoundingBox(x=x, y=y, w=200, h=50), confidence=0.9
+        )
+        return FreeFieldElement(
+            id=id,
+            bbox=BoundingBox(x=x, y=y, w=200, h=50),
+            fragments=[frag] if text else [],
+            merged_text=text,
+            role=role,
+            zone=Zone.HEADER,
+        )
+
+    def document(self):
+        elements = [
+            self.field("no", 60, 40, "رقم الفاتورة : 00008", CellRole.INVOICE_NUMBER),
+            self.field("city", 60, 170, "المدينة : ريف دمشق", CellRole.CITY),
+            self.field("date", 460, 170, "التاريخ : 2026/8/15", CellRole.INVOICE_DATE),
+            self.field("name", 860, 170, "الاسم : كرم هيثم", CellRole.MERCHANT_NAME),
+            self.field("total", 60, 900, "795.25", CellRole.TOTAL_AMOUNT),
+        ]
+        for row, (product, qty, unit, line_total) in enumerate(
+            [("سكر 1كغ", "2", "1.25", "2.50"), ("أرز بسمتي", "3", "8.50", "25.50")]
+        ):
+            y = 300 + row * 60
+            elements += [
+                self.cell(f"p{row}", 860, y, product, CellRole.PRODUCT_NAME, row, 4),
+                self.cell(f"q{row}", 660, y, qty, CellRole.QUANTITY, row, 3),
+                self.cell(f"u{row}", 460, y, unit, CellRole.UNIT_PRICE, row, 2),
+                self.cell(f"t{row}", 260, y, line_total, CellRole.LINE_TOTAL, row, 1),
+            ]
+        return StructuredDocument(elements=elements)
+
+    def test_header_fields_come_from_the_labelled_boxes(self):
+        draft = InvoiceParser().parse(self.document(), ocr())
+
+        assert draft.header.invoice_number.value == "00008"
+        assert draft.header.invoice_date.value == "2026-08-15"
+        assert draft.header.city.value == "ريف دمشق"
+        assert draft.header.total_amount.value == 795.25
+
+    def test_the_printed_caption_is_stripped_from_the_value(self):
+        """These forms print the caption inside the same ruled box as the value,
+        so the recognizer reads both and the caption has to come off before the
+        value is matched against a catalog."""
+        draft = InvoiceParser().parse(self.document(), ocr())
+
+        assert "المدينة" not in str(draft.header.city.value)
+        assert "رقم" not in str(draft.header.invoice_number.value)
+
+    def test_a_leading_zero_invoice_number_survives(self):
+        """"00008" is a string. Parsing it as a number eats the zeros."""
+        draft = InvoiceParser().parse(self.document(), ocr())
+        assert draft.header.invoice_number.value == "00008"
+
+    def test_every_header_field_carries_the_box_it_was_read_from(self):
+        """The point of the whole layout stage: clicking the merchant field on
+        the verification screen highlights the box the value came from, not a
+        line of reconstructed text."""
+        draft = InvoiceParser().parse(self.document(), ocr())
+
+        for name, value in draft.header.named_fields():
+            assert value.bbox is not None, name
+
+    def test_a_labelled_merchant_still_matches_the_catalog(self):
+        catalogs = Catalogs(merchants=[NamedEntry(name="كرم هيثم", entry_id=7)])
+        draft = InvoiceParser().parse(self.document(), ocr(), catalogs)
+
+        assert draft.header.merchant_name.matched_id == 7
+        assert draft.header.merchant_name.candidates
+
+    def test_a_weak_merchant_match_is_flagged_rather_than_accepted(self):
+        """Labelling the box says which field it is, not that whatever was read
+        from it is right. A wrong confident match still corrupts an invoice."""
+        catalogs = Catalogs(merchants=[NamedEntry(name="شركة الأمل التجارية", entry_id=9)])
+        draft = InvoiceParser().parse(self.document(), ocr(), catalogs)
+
+        assert draft.header.merchant_name.matched_id is None
+        assert draft.header.merchant_name.requires_manual_review
+        assert draft.header.merchant_name.candidates
+
+    def test_line_items_come_from_the_labelled_columns(self):
+        draft = InvoiceParser().parse(self.document(), ocr())
+
+        assert len(draft.line_items) == 2
+        first = draft.line_items[0]
+        assert first.quantity.value == 2
+        assert first.unit_price.value == 1.25
+        assert first.total_price.value == 2.50
+        assert first.arithmetic_ok
+
+    def test_a_mismatched_row_is_reported_not_reinterpreted(self):
+        """The column search exists to guess an unknown ordering. With the
+        columns labelled, a row whose arithmetic fails has a misread digit --
+        and reshuffling its columns to make the multiplication work would hide
+        exactly the error the verification screen exists to surface.
+        """
+        elements = list(self.document().elements)
+        for el in elements:
+            if el.id == "t1" and el.role is CellRole.LINE_TOTAL:
+                el.merged_text = "99.99"
+
+        draft = InvoiceParser().parse(StructuredDocument(elements=elements), ocr())
+        row = draft.line_items[1]
+
+        assert row.quantity.value == 3
+        assert row.unit_price.value == 8.50
+        assert row.total_price.value == 99.99
+        assert not row.arithmetic_ok
+        assert any(w.code == WarningCodes.ARITHMETIC_MISMATCH for w in draft.warnings)
+
+    def test_an_unlabelled_document_still_uses_the_heuristics(self):
+        """The fallback has to stay: an unruled receipt has no layout at all."""
+        result = ocr(
+            fragment("التاريخ:", 400, 100),
+            fragment("14/03/2026", 300, 100),
+        )
+        draft = InvoiceParser().parse(free_document(result), result)
+
+        assert draft.header.invoice_date.value == "2026-03-14"

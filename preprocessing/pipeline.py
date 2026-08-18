@@ -13,6 +13,16 @@ class PreprocessingPipeline:
     """Executes an ordered list of already-instantiated steps against one
     image. Three instances exist per run -- geometric, ocr_photometric,
     table_photometric -- sequenced by PipelineOrchestrator.
+
+    `run()` never touches the payload it is given. That is not tidiness, it is
+    what makes the fork a fork: the orchestrator runs the OCR branch and the
+    table branch against the *same* geometrically corrected payload, and while
+    `run()` mutated its argument the second branch was silently reading the
+    first branch's output instead. The observable damage was that the table
+    extractor worked from an illumination-normalized image it was never meant to
+    see, and the "display image" handed to the desktop UI -- the one every bbox
+    is measured against and the user actually looks at -- was the final
+    binarized mask rather than the corrected page.
     """
 
     def __init__(self, steps: list[PreprocessingStep]):
@@ -33,7 +43,7 @@ class PreprocessingPipeline:
         anything to disk -- which is what the `enhanced_image_png` debug image
         in the API contract is.
         """
-        ctx = PipelineContext(payload=initial_payload)
+        ctx = PipelineContext(payload=self._fork(initial_payload))
 
         # Steps that can produce an extra diagnostic image read this before
         # building one. Without it, a step like thresholding would render its
@@ -65,6 +75,24 @@ class PreprocessingPipeline:
         if snapshots is not None:
             snapshots["__final__"] = ctx.payload.image
         return ctx.payload
+
+    @staticmethod
+    def _fork(payload: ImagePayload) -> ImagePayload:
+        """A private payload for this branch, sharing the caller's pixels.
+
+        The arrays themselves are not copied and do not need to be: every step
+        assigns a *new* array to `payload.image` rather than writing into the
+        existing one, so the caller's image is never touched. What has to be
+        fresh is the payload struct and its lists -- otherwise two branches
+        append to one `applied_steps` and overwrite each other's `metadata`.
+        """
+        return ImagePayload(
+            image=payload.image,
+            transform=payload.transform,
+            applied_steps=list(payload.applied_steps),
+            metadata=dict(payload.metadata),
+            debug_images=list(payload.debug_images),
+        )
 
     @staticmethod
     def _save_debug_image(debug_dir: Path, file_stem: str, image) -> None:

@@ -16,21 +16,21 @@ import cv2
 import numpy as np
 
 from config.schema import AppConfig
-from core.domain.document import StructuredDocument
 from core.domain.image_payload import ImagePayload
+from core.domain.layout import InvoiceLayout
 from core.domain.matching import KeywordDictionary, MatchedElement, MatchResult
-from core.domain.ocr import OCRResult
 from core.domain.result import PipelineResult
-from core.domain.table import TableExtractionResult
-from invoice.models import InvoiceDraft
-from invoice.parser import Catalogs, InvoiceParser
+from core.domain.run import PipelineRun
+from core.exceptions import NotImplementedStrategyError
+from core.domain.invoice import InvoiceDraft, InvoiceWarning, WarningCodes
+from core.domain.catalog import Catalogs
+from invoice.parser import InvoiceParser
 from mapping.cell_mapper import CellMapper
-from ocr.factory import build_ocr_engine
+from orchestration.flows.factory import build_flow
 from output.factory import build_output_formatter
 from persistence.file_result_store import FileResultStore
 from preprocessing.pipeline_builder import PreprocessingPipelineBuilder
 from string_matching.factory import build_string_matcher
-from table_extraction.factory import build_table_extractor
 
 logger = logging.getLogger(__name__)
 
@@ -41,40 +41,15 @@ logger = logging.getLogger(__name__)
 _BINARIZING_STEPS = frozenset({"fixed_threshold", "otsu_threshold", "adaptive_threshold"})
 
 
-@dataclass
-class PipelineRun:
-    """Everything one invocation produced.
-
-    `output` is the formatter's view -- what goes on the wire. `result` is the
-    canonical domain object behind it. The images are kept in memory rather
-    than read back off disk so the HTTP layer can encode them without a round
-    trip through the filesystem.
-    """
-
-    result: PipelineResult
-    output: object
-    display_image: np.ndarray
-    enhanced_image: np.ndarray
-    ocr_input_image: np.ndarray
-    applied_steps: list[str] = field(default_factory=list)
-
-    def __repr__(self) -> str:  # pragma: no cover - convenience for the CLI
-        invoice = self.result.invoice
-        items = len(invoice.line_items) if invoice else 0
-        return (
-            f"PipelineRun(invoice_id={self.result.invoice_id!r}, "
-            f"elements={len(self.result.elements)}, line_items={items})"
-        )
-
-
 class PipelineOrchestrator:
-    def __init__(self, config: AppConfig, ocr_engine=None):
-        """`ocr_engine` lets a caller inject an already-constructed engine.
+    def __init__(self, config: AppConfig, ocr_components=None):
+        """`ocr_components` lets a caller inject already-constructed models.
 
         The HTTP layer needs this: a request may change a preprocessing
-        parameter, which means a new orchestrator, but rebuilding the OCR
-        engine along with it would reload the model weights -- about a minute
-        for the VLM path -- for a change that has nothing to do with OCR.
+        parameter, which means a new orchestrator, but rebuilding the detector
+        and recognizer along with it would reload the model weights -- about a
+        minute for the VLM path -- for a change that has nothing to do with
+        reading text.
         """
         self.config = config
 
@@ -91,11 +66,15 @@ class PipelineOrchestrator:
             config.preprocessing.table_photometric_steps
         )
 
-        self.ocr_engine = ocr_engine if ocr_engine is not None else build_ocr_engine(config.ocr)
-        self.table_extractor = build_table_extractor(config.table_extraction)
+        self.cell_mapper = CellMapper()
+
+        # The flow owns the table extractor, the layout classifier and whichever
+        # of detector/cropper/recognizer/engine it declared. Which three stages
+        # run, and in what order, is its decision -- see orchestration/flows/.
+        self.flow = build_flow(config, self.cell_mapper, components=ocr_components)
+
         self.string_matcher = build_string_matcher(config.string_matching)
         self.output_formatter = build_output_formatter(config.output)
-        self.cell_mapper = CellMapper()
         self.invoice_parser = InvoiceParser()
         self.result_store = FileResultStore(**config.persistence.store_params)
 
@@ -109,22 +88,15 @@ class PipelineOrchestrator:
 
     @property
     def engine_name(self) -> str:
-        return self.config.ocr.engine
+        return self.flow.engine_name
 
     def is_ready(self) -> bool:
-        """Whether the OCR engine can serve a request right now.
-
-        An engine that does not implement `is_ready` has nothing to load --
-        it was constructed successfully, so it is ready.
-        """
-        probe = getattr(self.ocr_engine, "is_ready", None)
-        return bool(probe()) if callable(probe) else True
+        """Whether this pipeline can serve a request right now."""
+        return self.flow.is_ready()
 
     def warmup(self) -> None:
         """Load weights / verify binaries up front, so readiness is not a lie."""
-        warm = getattr(self.ocr_engine, "warmup", None)
-        if callable(warm):
-            warm()
+        self.flow.warmup()
 
     @staticmethod
     def _load_keyword_dictionary(path: str) -> KeywordDictionary:
@@ -141,16 +113,18 @@ class PipelineOrchestrator:
 
     @staticmethod
     def _run_optional_stage(stage_name, fn, fallback_factory):
-        """Runs a downstream stage that may still be an unimplemented stub.
+        """Runs a downstream stage that may be a deliberately-unbuilt strategy.
 
-        If `fn` raises NotImplementedError (the stage hasn't been built by
-        its owner yet), log a warning and substitute a placeholder value of
-        the correct type instead of crashing the whole run -- preprocessing
-        (and everything up to it) should still complete and persist.
+        Catches `NotImplementedStrategyError` only -- the exception a registered
+        but unimplemented strategy raises on purpose. A plain
+        `NotImplementedError` escaping from inside working code is a bug, and
+        catching it here used to convert that bug into silently empty output:
+        the run completed, the response validated, and the page came back blank
+        with nothing to say why.
         """
         try:
             return fn()
-        except NotImplementedError as exc:
+        except NotImplementedStrategyError as exc:
             logger.warning("Skipping stage '%s' (not implemented yet): %s", stage_name, exc)
             return fallback_factory()
 
@@ -197,27 +171,13 @@ class PipelineOrchestrator:
             debug_dir=debug_root / "table_photometric" if debug_root else None,
         )
 
-        # 3. Recognition, sequentially. Both stages may still be
-        #    unimplemented for other engines/extractors -- skip gracefully.
-        ocr_result = self._run_optional_stage(
-            "ocr_engine.recognize",
-            lambda: self.ocr_engine.recognize(ocr_payload),
-            lambda: OCRResult(fragments=[], engine_name=f"{self.config.ocr.engine}(unimplemented)"),
-        )
-        table_result = self._run_optional_stage(
-            "table_extractor.extract",
-            lambda: self.table_extractor.extract(table_payload),
-            lambda: TableExtractionResult(
-                tables=[], extractor_name=f"{self.config.table_extraction.extractor}(unimplemented)"
-            ),
-        )
-
-        # 4. Mapping: OCR fragments -> table cells / free fields.
-        structured_doc = self._run_optional_stage(
-            "cell_mapper.map",
-            lambda: self.cell_mapper.map(ocr_result, table_result),
-            lambda: StructuredDocument(elements=[]),
-        )
+        # 3-4. Layout analysis, recognition and mapping, sequenced by the
+        #      configured flow. Which of them run in which order is the flow's
+        #      decision and the only thing the three strategies disagree on;
+        #      everything either side of this call is identical for all three.
+        outcome = self.flow.run(ocr_payload, table_payload)
+        ocr_result = outcome.ocr_result
+        structured_doc = outcome.document
 
         # 5. String matching -- same keyword dictionary for every element,
         #    table cell or free field alike (per project decision). This is the
@@ -241,6 +201,16 @@ class PipelineOrchestrator:
             lambda: self.invoice_parser.parse(structured_doc, ocr_result, catalogs),
             lambda: InvoiceDraft(),
         )
+
+        # A flow that could not do its job says so on the wire, not only in the
+        # log. "layout_driven found no grid" and "this invoice is blank" produce
+        # the same empty result otherwise, and the user can only act on the
+        # first one.
+        for message in outcome.warnings:
+            logger.warning("[%s] %s", self.flow.name, message)
+            invoice.warnings.append(
+                InvoiceWarning(code=WarningCodes.NO_LAYOUT_DETECTED, message=message)
+            )
 
         # 7. Assemble the canonical result, with a full config snapshot for
         #    audit/reproducibility, and persist it.
@@ -271,6 +241,7 @@ class PipelineOrchestrator:
         return PipelineRun(
             result=result,
             output=output,
+            layout=outcome.layout,
             display_image=display_payload.image,
             enhanced_image=self._enhanced_image(ocr_snapshots, ocr_payload.image),
             ocr_input_image=ocr_payload.image,

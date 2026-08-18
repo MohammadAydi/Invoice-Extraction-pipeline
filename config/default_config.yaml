@@ -22,7 +22,10 @@ preprocessing:
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+    # invert: the table extractors reconstruct the grid by eroding the FOREGROUND,
+    # so they need ink at 255. Without it they get an ink-at-0 image and
+    # reconstruct the paper instead of the rules.
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 15, c: 10, invert: true}}
 
 ocr:
   engine: tesseract

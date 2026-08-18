@@ -11,45 +11,50 @@ preprocessing:
     - {name: adaptive_threshold, enabled: false, params: {block_size: 51, c: 35}}
     - {name: morphological_cleanup, enabled: false, params: {operation: open, kernel_size: 2}}
 
+  # The table branch feeds the cell detector, which reconstructs the grid by
+  # eroding and dilating the FOREGROUND -- so it needs ink at 255, not the
+  # ink-at-0 an OCR engine wants. That is what `invert: true` is for.
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 25, c: 35}}
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 15, c: 10, invert: true}}
+
+# Layout first: the printed grid is detected and classified, then every labelled
+# cell is cropped and read with the prompt its role implies. No text detector
+# runs. See orchestration/flows/layout_driven.py.
+flow:
+  name: layout_driven
 
 ocr:
-  engine: surya_qwen
-  engine_params:
-    backend: subprocess
-    worker_python: "D:\\OCR\\.venv_vlm\\Scripts\\python.exe"
-    worker_script: "tools/qwen_worker.py"
-    #model_path: "D:\\Arabic-Qwen3.5-OCR-v4"
-    model_path: "D:\\Arabic-handwritten-OCR-4bit-Qwen2.5-VL-3B-v3"
-    arch: qwen2_5_vl
-    max_new_tokens: 64
+  cropper:
+    name: padded_crop
+    params: {pad: 10, upscale: 2, min_side: 8}
 
+  recognizer:
+    name: qwen
+    params:
+      backend: subprocess
+      worker_python: "qwen_venv\\Scripts\\python.exe"
+      worker_script: "tools/qwen_worker.py"
+      model_path: "models\\qwen"
+      arch: qwen2_5_vl
+      max_new_tokens: 64
+      default_kind: any
 
-    kind: any
-
-    pad: 10
-    upscale: 2
-
-    column_kinds:
-      - { kind: number,      from: 0.000, to: 0.163, role: price }
-      - { kind: number,      from: 0.163, to: 0.285, role: qty }
-      - { kind: arabic_text, from: 0.285, to: 0.775, role: desc }
-      - { kind: number,      from: 0.775, to: 0.940, role: total }
-
-    split_on_columns: true
-    min_split_width: 45
-    split_inset: 10
-    ignore_beyond_x: 0.94
-
-    fill_missing_cells: true
-    row_tolerance: 0.35
-    debug_dir: "det"
-
+# `column_kinds` used to live under ocr, declaring the column boundaries as
+# fractions of the page width (0.163 / 0.285 / 0.775) measured once by hand.
+# The grid supplies the real boundaries now, measured on each photograph, so
+# there is nothing to declare -- and nothing to be wrong when a page is cropped
+# differently. The detector-driven flow still needs them; see
+# config/qwen_detector_config.yaml.
 table_extraction:
   extractor: contour_based
   extractor_params: {}
+  classifier: bill_layout
+  classifier_params:
+    table_row_count: 10
+    table_col_count: 6
+    # Left to right, as the columns of this RTL form appear in pixel order.
+    column_roles: [notes, line_total, unit_price, quantity, product_name, line_number]
 
 string_matching:
   algorithm: levenshtein

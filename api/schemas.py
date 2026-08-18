@@ -124,6 +124,15 @@ class OverlayElement(BaseModel):
 
     id: str
     kind: str
+
+    # Which invoice field the layout stage decided this box holds
+    # ("invoice_number", "quantity", "total_amount", ...) and roughly where it
+    # sits ("header" / "table" / "footer"). Both are "unknown" when no layout
+    # classifier ran, so a client can tell "not classified" from "classified as
+    # nothing".
+    role: str = "unknown"
+    zone: str = "unknown"
+
     bbox: list[int]
     raw_text: str = ""
     corrected_text: str = ""
@@ -134,6 +143,11 @@ class OverlayElement(BaseModel):
     table_id: str | None = None
     row: int | None = None
     col: int | None = None
+
+    # A totals row with no vertical dividers drawn across it is one wide cell,
+    # not several narrow ones.
+    row_span: int = 1
+    col_span: int = 1
 
 
 class ExtractionWarning(BaseModel):
@@ -352,6 +366,7 @@ class WarningCodes:
     SKEW_CORRECTED = "SKEW_CORRECTED"
     DEBUG_IMAGE_UNAVAILABLE = "DEBUG_IMAGE_UNAVAILABLE"
     MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
+    NO_LAYOUT_DETECTED = "NO_LAYOUT_DETECTED"
 
 
 class ErrorCodes:

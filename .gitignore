@@ -232,3 +232,4 @@ det/
 cells_detected.png
 grid_mask_debug.png
 binary_debug.png
+models/

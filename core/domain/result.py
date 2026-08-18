@@ -2,12 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING
 
+from core.domain.invoice import InvoiceDraft
 from core.domain.matching import MatchedElement
-
-if TYPE_CHECKING:
-    from invoice.models import InvoiceDraft
 
 
 @dataclass
@@ -29,7 +26,7 @@ class PipelineResult:
     invoice_id: str
     display_image_path: str
     elements: list[MatchedElement] = field(default_factory=list)
-    invoice: "InvoiceDraft | None" = None
+    invoice: InvoiceDraft | None = None
     raw_text: str = ""
     ocr_engine: str = ""
     config_snapshot: dict = field(default_factory=dict)

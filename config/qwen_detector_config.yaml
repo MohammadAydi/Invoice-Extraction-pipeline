@@ -1,0 +1,93 @@
+# The detector-driven flow: Surya finds the boxes, Qwen reads them.
+#
+# This is what `ocr.engine: surya_qwen` used to do, unchanged in behaviour and
+# split into four collaborators. Kept alongside config/qwen_config.yaml so the
+# two flows can be compared on the same invoice:
+#
+#   python main.py data/raw/test1.jpg config/qwen_config.yaml           # layout
+#   python main.py data/raw/test1.jpg config/qwen_detector_config.yaml  # detector
+#
+# Use this one when text sits outside the printed grid. Its known weakness is
+# that the detector misses short isolated digits -- a quantity of one or two
+# characters is often never boxed, and therefore never read.
+
+preprocessing:
+  geometric_steps:
+    - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
+    - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
+
+  ocr_photometric_steps:
+    - {name: channel_selection, enabled: true, params: {channel: gray}}
+    - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
+    - {name: clahe, enabled: false, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
+    - {name: bilateral_filter, enabled: false, params: {d: 5, sigma_color: 50, sigma_space: 50}}
+    - {name: adaptive_threshold, enabled: false, params: {block_size: 51, c: 35}}
+    - {name: morphological_cleanup, enabled: false, params: {operation: open, kernel_size: 2}}
+
+  table_photometric_steps:
+    - {name: channel_selection, enabled: true, params: {channel: gray}}
+    - {name: adaptive_threshold, enabled: true, params: {block_size: 15, c: 10, invert: true}}
+
+flow:
+  name: detector_driven
+
+ocr:
+  detector:
+    name: surya_detector
+    params:
+      min_side: 12
+      ignore_beyond_x: 0.94
+
+  # The x-fraction column layout. Measured by hand on one printed form, and
+  # wrong the moment a page is cropped differently -- which is exactly why the
+  # layout-driven flow exists. Kept here because this flow has no grid to ask.
+  refiner:
+    name: column_fraction
+    params:
+      column_kinds:
+        - {kind: number,      from: 0.000, to: 0.163}
+        - {kind: number,      from: 0.163, to: 0.285}
+        - {kind: arabic_text, from: 0.285, to: 0.775}
+        - {kind: number,      from: 0.775, to: 0.940}
+      split_on_columns: true
+      min_split_width: 45
+      split_inset: 10
+      fill_missing_cells: true
+      row_tolerance: 0.35
+
+  cropper:
+    name: padded_crop
+    params: {pad: 10, upscale: 2, min_side: 8}
+
+  recognizer:
+    name: qwen
+    params:
+      backend: subprocess
+      worker_python: "qwen_venv\\Scripts\\python.exe"
+      worker_script: "tools/qwen_worker.py"
+      model_path: "models\\qwen"
+      arch: qwen2_5_vl
+      max_new_tokens: 64
+      default_kind: any
+
+table_extraction:
+  extractor: contour_based
+  extractor_params: {}
+  classifier: bill_layout
+  classifier_params:
+    table_row_count: 10
+    table_col_count: 6
+    column_roles: [notes, line_total, unit_price, quantity, product_name, line_number]
+
+string_matching:
+  algorithm: levenshtein
+  algorithm_params: {max_distance: 2}
+  dictionary_path: "keywords/ar_invoice_terms.json"
+
+output:
+  formatter: ui_overlay_json
+  formatter_params: {}
+
+persistence:
+  store: file_result_store
+  store_params: {output_dir: "results/"}

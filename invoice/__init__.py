@@ -1,12 +1,12 @@
-"""The invoice-shaped view of a pipeline run: models, line reconstruction, parser."""
+"""Reading a StructuredDocument as an invoice.
 
-from invoice.models import (  # noqa: F401
-    REVIEW_CONFIDENCE_THRESHOLD,
-    ExtractedValue,
-    InvoiceDraft,
-    InvoiceHeader,
-    InvoiceLineItem,
-    InvoiceWarning,
-    WarningCodes,
-)
-from invoice.parser import Catalogs, InvoiceParser  # noqa: F401
+The models this produces -- `InvoiceDraft` and everything it holds -- live in
+`core.domain.invoice` with the rest of the domain. What is here is the parsing:
+the header heuristics, the column assignment, and the line reconstruction the
+header path needs.
+"""
+
+from invoice.parser import InvoiceParser  # noqa: F401
+from invoice.text_lines import group_lines  # noqa: F401
+
+__all__ = ["InvoiceParser", "group_lines"]

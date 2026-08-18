@@ -16,7 +16,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from core.domain.geometry import BoundingBox
-from string_matching.catalog import FieldMatch
+from core.domain.catalog import FieldMatch
 
 # Fields scoring below this are flagged for review rather than rejected. Shared
 # with the API contract's confidence threshold so the verification screen has
@@ -189,3 +189,4 @@ class WarningCodes:
     SKEW_CORRECTED = "SKEW_CORRECTED"
     DEBUG_IMAGE_UNAVAILABLE = "DEBUG_IMAGE_UNAVAILABLE"
     MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
+    NO_LAYOUT_DETECTED = "NO_LAYOUT_DETECTED"
