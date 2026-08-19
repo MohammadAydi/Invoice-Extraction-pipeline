@@ -345,7 +345,13 @@ class BillLayoutClassifier:
 
         The invoice number is the box nearest the top-left corner of the header
         block, scored on normalized x + y so neither axis dominates on a page of
-        any aspect ratio.
+        any aspect ratio. It is scored across **the whole header block**, not
+        within its topmost row: a row holding a single cell normalizes to a
+        score of zero on both axes -- `max(range, 1.0)` divided into a spread of
+        zero -- so whatever sat in it won by default and its position was never
+        consulted at all. A page-edge sliver above the real header row is exactly
+        that case, and it took the invoice number on a real scan while the box
+        actually reading "رقم الفاتورة : 00010" was left unlabelled.
 
         City / date / merchant are bucketed across **the header row nearest the
         table**, not across every cell above it. Bucketing everything is what the
@@ -360,14 +366,13 @@ class BillLayoutClassifier:
 
         rows = _cluster_rows(above)
 
-        first_row = rows[0]
-        xs = [c.x_center for c in first_row]
+        xs = [c.x_center for c in above]
         x_min, x_range = min(xs), max(max(xs) - min(xs), 1.0)
-        ys = [c.y_center for c in first_row]
+        ys = [c.y_center for c in above]
         y_min, y_range = min(ys), max(max(ys) - min(ys), 1.0)
 
         invoice_number = min(
-            first_row,
+            above,
             key=lambda c: (c.x_center - x_min) / x_range + (c.y_center - y_min) / y_range,
         )
         invoice_number.role = CellRole.INVOICE_NUMBER

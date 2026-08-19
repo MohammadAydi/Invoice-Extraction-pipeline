@@ -33,9 +33,9 @@ ocr:
     name: qwen
     params:
       backend: subprocess
-      worker_python: "qwen_venv\\Scripts\\python.exe"
+      worker_python: "qwen_venv/Scripts/python.exe"
       worker_script: "tools/qwen_worker.py"
-      model_path: "models\\qwen"
+      model_path: "models/qwen"
       arch: qwen2_5_vl
       max_new_tokens: 64
       default_kind: any

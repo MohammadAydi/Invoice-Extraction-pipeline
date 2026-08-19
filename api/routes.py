@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import logging
 import time
-import uuid
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse
@@ -20,9 +19,7 @@ from api.schemas import (
     ExtractionOptions,
     ExtractionResult,
     ExtractionSource,
-    ExtractionWarning,
     HealthStatus,
-    WarningCodes,
 )
 from api.service_settings import (
     MAX_UPLOAD_BYTES,
@@ -31,6 +28,7 @@ from api.service_settings import (
     get_settings,
 )
 from config.schema import AppConfig
+from config.settings_contract import PipelineSettings
 from core.domain.image_payload import ImagePayload
 from core.exceptions import ConfigurationError, StepExecutionError
 from core.domain.catalog import Catalogs
@@ -39,6 +37,10 @@ from core.domain.catalog import NamedEntry
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1")
+
+# The only formatter whose output this endpoint's response model describes. See
+# _resolve_config: it is forced onto every request rather than being a setting.
+WIRE_FORMATTER = "invoice_json"
 
 
 def error_response(
@@ -85,7 +87,16 @@ async def extract(
     request: Request,
     file: UploadFile = File(...),
     options: str | None = Form(default=None),
+    config: str | None = Form(default=None),
 ) -> JSONResponse:
+    """Three parts: the image, the per-batch `options`, the `config`.
+
+    `config` is separate from `options` because the two are owned by different
+    parts of the desktop app and change on different schedules: options carry
+    the catalogs of the batch being processed, the configuration is what the
+    settings page saved. Omitting `config` runs the service's own defaults,
+    which is what the CLI and a fresh installation do.
+    """
     started = time.perf_counter()
     settings = get_settings()
 
@@ -102,6 +113,21 @@ async def extract(
             )
     else:
         parsed_options = ExtractionOptions()
+
+    # --- configuration ---------------------------------------------------
+    parsed_config: PipelineSettings | None = None
+
+    if config:
+        try:
+            parsed_config = PipelineSettings.model_validate(json.loads(config))
+        except (json.JSONDecodeError, ValidationError, ValueError) as exc:
+            return error_response(
+                422,
+                ErrorCodes.INVALID_CONFIGURATION,
+                "The 'config' part was not valid JSON matching the pipeline "
+                "configuration schema.",
+                str(exc),
+            )
 
     # --- file validation -------------------------------------------------
     filename = file.filename or "upload"
@@ -130,14 +156,13 @@ async def extract(
 
     pool = _pool(request)
 
-    # --- configuration ---------------------------------------------------
     try:
-        config = _resolve_config(pool, parsed_options)
+        app_config = _resolve_config(pool, parsed_config)
     except (ValidationError, ValueError) as exc:
         return error_response(
             422,
             ErrorCodes.INVALID_CONFIGURATION,
-            "The 'configuration' object was rejected by the pipeline.",
+            "The 'config' object was rejected by the pipeline.",
             str(exc),
         )
 
@@ -155,21 +180,21 @@ async def extract(
     # Checked against the configuration this request will actually run, not the
     # service default: a request selecting a different engine must not be
     # refused because the default one is unavailable.
-    if not pool.is_ready(config):
+    if not pool.is_ready(app_config):
         # Named by flow, not by `ocr.engine`: under the two region-based flows
         # there is no single engine and `ocr.engine` is not even set, so
         # reporting it would say "engine 'None' is not ready".
         return error_response(
             503,
             ErrorCodes.ENGINE_NOT_READY,
-            f"The '{config.flow.name}' pipeline is not ready "
-            f"({config.ocr.engine or 'detector/recognizer components'}). It may "
+            f"The '{app_config.flow.name}' pipeline is not ready "
+            f"({app_config.ocr.engine or 'detector/recognizer components'}). It may "
             "still be loading, or its dependencies may not be installed.",
         )
 
     # --- run the pipeline ------------------------------------------------
     try:
-        orchestrator = pool.get(config)
+        orchestrator = pool.get(app_config)
         run = orchestrator.run(
             ImagePayload(image=document.image),
             catalogs=_catalogs(parsed_options),
@@ -204,11 +229,11 @@ async def extract(
     body = run.output if isinstance(run.output, dict) else {}
     height, width = run.display_image.shape[:2]
 
-    warnings = [ExtractionWarning(**w) for w in body.get("warnings", [])]
-
     # --- diagnostic images -----------------------------------------------
     # Deliberately outside the try above: a PNG that fails to encode is not an
-    # OCR failure, and must not turn a good extraction into a 500.
+    # OCR failure, and must not turn a good extraction into a 500. It fails
+    # silently to null -- there is no warning array on the wire any more, and a
+    # missing preview is something the user can see for themselves.
     enhanced_png: str | None = None
     ocr_input_png: str | None = None
 
@@ -217,19 +242,11 @@ async def extract(
         enhanced_png = encode_png_base64(run.enhanced_image, max_width=max_width)
         ocr_input_png = encode_png_base64(run.ocr_input_image, max_width=max_width)
 
-        if enhanced_png is None or ocr_input_png is None:
-            warnings.append(
-                ExtractionWarning(
-                    code=WarningCodes.DEBUG_IMAGE_UNAVAILABLE,
-                    message=(
-                        "A diagnostic image could not be encoded; the extraction "
-                        "itself is unaffected."
-                    ),
-                )
-            )
-
+    # The formatter produced the invoice body; the envelope is this layer's,
+    # because only it knows about the request. Validated through the model on
+    # the way out, so a formatter that drifts from the contract fails here
+    # rather than in the desktop app's deserializer.
     result = ExtractionResult(
-        request_id=str(uuid.uuid4()),
         processing_ms=int((time.perf_counter() - started) * 1000),
         source=ExtractionSource(
             filename=filename,
@@ -238,13 +255,12 @@ async def extract(
             width=width,
             height=height,
         ),
-        header=body.get("header") or {},
-        line_items=body.get("line_items", []),
-        warnings=warnings,
-        raw_text=body.get("raw_text", ""),
-        invoice_id=body.get("invoice_id"),
-        ocr_engine=body.get("ocr_engine"),
-        elements=body.get("elements", []),
+        invoice_id=body.get("invoice_id") or {},
+        customer_name=body.get("customer_name") or {},
+        date=body.get("date") or {},
+        city=body.get("city") or {},
+        products=body.get("products", []),
+        total_invoice_price=body.get("total_invoice_price") or {},
         enhanced_image_png=enhanced_png,
         ocr_input_image_png=ocr_input_png,
     )
@@ -252,25 +268,36 @@ async def extract(
     return JSONResponse(status_code=200, content=result.model_dump(mode="json"))
 
 
-def _resolve_config(pool: PipelinePool, options: ExtractionOptions) -> AppConfig:
+def _resolve_config(
+    pool: PipelinePool, settings: PipelineSettings | None
+) -> AppConfig:
     """The configuration this request runs under.
 
-    A request that sends none inherits the service's default file, which is
-    what the CLI and the tests rely on. One that sends a `configuration` object
-    gets exactly that, with the table branch's preprocessing filled in from the
-    default -- the settings contract deliberately does not expose it.
-    """
-    if options.configuration is None:
-        return pool.default_config
+    A request that sends no `config` part inherits the service's default file,
+    which is what the CLI and the tests rely on. One that sends it gets exactly
+    that, with the table branch's preprocessing filled in from the default --
+    the settings contract deliberately does not expose it.
 
-    # Resolved against the project root for the same reason the default file is:
-    # the desktop app sends `keywords/ar_invoice_terms.json` back unchanged, and
-    # the service is not started from this directory.
-    return resolve_paths(
-        options.configuration.to_app_config(
-            table_photometric_steps=pool.default_table_photometric_steps
+    The output formatter is forced either way. It is not a user setting: it *is*
+    the response shape this endpoint documents, and a configuration naming a
+    different one would return a body the desktop app cannot read while every
+    other part of the request looked perfectly valid.
+    """
+    if settings is None:
+        config = pool.default_config.model_copy(deep=True)
+    else:
+        # Resolved against the project root for the same reason the default file
+        # is: the desktop app sends `keywords/ar_invoice_terms.json` back
+        # unchanged, and the service is not started from this directory.
+        config = resolve_paths(
+            settings.to_app_config(
+                table_photometric_steps=pool.default_table_photometric_steps
+            )
         )
-    )
+
+    config.output.formatter = WIRE_FORMATTER
+    config.output.formatter_params = {}
+    return config
 
 
 def _catalogs(options: ExtractionOptions) -> Catalogs:

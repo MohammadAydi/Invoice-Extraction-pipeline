@@ -21,12 +21,16 @@ This repo is one of three components:
    and a mobile-upload companion feature.
 3. A mobile app that lets users photograph invoices and send them to the desktop app.
 
-Two documents in this repo are the binding contracts with the C# side — **read them before
-touching anything that crosses the boundary**:
+Two documents are the binding contracts with the C# side — **read them before touching
+anything that crosses the boundary**. Both now live in the repo's shared `docs/` folder,
+beside the database schema; the files of the same names in this directory are three-line
+pointers to them:
 
-- [api-contract.md](api-contract.md) — the `/extract` request/response JSON shape.
-- [settings-config-contract.md](settings-config-contract.md) — the object-keyed
-  `configuration` shape the desktop settings page sends, and how it's assembled per
+- [../docs/api-contract.md](../docs/api-contract.md) — the `/extract` request/response JSON
+  shape. The request is **three** multipart parts (`file`, `options`, `config`) and the
+  response has one named key per invoice field.
+- [../docs/settings-config-contract.md](../docs/settings-config-contract.md) — the
+  object-keyed `config` part the desktop settings page sends, and how it's assembled per
   preprocessing step.
 
 Changing either side (Pydantic schemas here, C# DTOs there) without updating the other and
@@ -97,12 +101,18 @@ every other module knows only its own interface. `PipelineOrchestrator.run()`:
    strategies disagree on.
 4. `string_matcher.match()` — generic keyword-dictionary correction, run against every
    element (table cell or free field alike) using the shared keyword dictionary.
-6. `InvoiceParser.parse()` — reads the elements as an invoice: header fields (merchant,
+5. `InvoiceParser.parse()` — reads the elements as an invoice: header fields (merchant,
    invoice number, date, city, total) + line items + warnings, matching merchant/city/product
-   names against the **request's** catalogs (`known_merchants`/`known_products` — these come
-   from the request, not from config, because they're the C# side's live Customers/Products
-   tables).
-6. Assembles a `PipelineResult` (with a full `config_snapshot` for audit/reproducibility),
+   names against the **request's** catalogs (`known_merchants`/`known_products`/`known_cities`
+   — these come from the request, not from config, because they're the C# side's live
+   Customers/Products tables and the distinct `Customers.City` values).
+6. `invoice.reconciliation.reconcile()` — arithmetic repair of the line items. The
+   recognizers misplace the decimal separator far more often than they misread a digit, so
+   every legal separator position is tried and the one satisfying `price × qty = total` is
+   kept; a row with two readings and one blank has the third derived. A row the equation
+   cannot settle is left exactly as it was read. It runs on the parsed draft rather than
+   inside the parser because it is a property of the three numbers **together**.
+7. Assembles a `PipelineResult` (with a full `config_snapshot` for audit/reproducibility),
    persists it via `ResultStore`, hands it to `output_formatter.format()`.
 
 Any stage that raises `NotImplementedStrategyError` (a registered-but-unbuilt strategy) is
@@ -237,19 +247,23 @@ each pluggable family implements.
 | Merchant, city, governorate | Normalized Levenshtein over the whole string | Wrong one letter at a time. |
 | Product name | Order-independent word matching | Words are usually right, order isn't — "جاكيت صوف أزرق" vs "جاكيت أزرق صوف" is the same product; each OCR word takes its best score against catalog words, divided by the larger word count. |
 
-Both return the **top five** matches ranked highest-first (never a single answer) — the
-desktop app pre-selects the best and offers the rest as one-click corrections. Anything
-scoring below **0.75** comes back with `requires_manual_review` set and the raw OCR text
-left as the value; a wrong *confident* match is worse than a flagged uncertain one.
+Both return the **top five** matches ranked highest-first, never a single answer. A matched
+field on the wire carries **no value at all** — only `original_value`, which is always the
+raw OCR text, and `results`, the ranked list. Applying the **0.75** threshold to that list
+is the desktop app's job, done in exactly one place (`ExtractionMapper`). This side reports
+the scores and decides nothing: a wrong *confident* match silently corrupts an invoice, and
+a shape that carries both a value and a candidate list cannot say which of the two the
+value was.
 
 Normalization (`string_matching/normalization.py`) runs before any comparison: Arabic-Indic
 digits → ASCII, diacritics/tatweel stripped, أ/إ/آ→ا, ى→ي, ة→ه, punctuation stripped,
 whitespace collapsed, case folded. Digits are kept — they're part of real product names.
 
-**These exact rules are mirrored in `InvoiceDigitizationApp/Helpers/{TextNormalizer,FuzzyMatch}.cs`**
-in the other repo, because the desktop app re-matches locally when the service returns no
-candidates. Changing normalization or matching logic here without updating the C# copy will
-make the two sides disagree.
+**Normalization and matching live here and nowhere else.** The desktop app used to carry
+its own copies in `Helpers/{TextNormalizer,FuzzyMatch,CatalogMatcher}.cs` so it could
+re-match locally when the service returned no candidates; those are deleted. The app shows
+the ranked `results` this side produced and, below them, the rest of the catalog — so
+there is no second implementation for a change here to drift from.
 
 ### Preprocessing pipeline detail
 
@@ -304,6 +318,23 @@ re-deskew and re-threshold whatever arrived, which rotated the page a second tim
 every cell bbox in a coordinate space no OCR bbox shared — invisibly, because a
 wrongly-placed box is still a perfectly valid box.
 
+**A stray box above the header used to steal the invoice number.** `bill_layout` scored the
+invoice-number candidate *within the topmost header row*. A row holding one cell normalizes
+to zero on both axes — `max(range, 1.0)` divided into a spread of zero — so whatever sat in
+it won by default and its position was never consulted. A 71×222 sliver of the page edge,
+closed as its own contour at the top right of `images/test1.jpg`, therefore took
+`invoice_number`, was cropped, read with the free-text prompt, and came back an invented
+Arabic sentence, while the box reading `رقم الفاتورة : 00010` stayed `unknown`. Scoring
+across the whole header block is what makes the corner mean something.
+
+**Preprocessing tuned for a binarizing engine can destroy handwriting for a VLM.** The
+recognizer crops from the OCR-photometric image, not from the page the UI shows, so a step
+that helps printed text can quietly wreck a field while leaving the printed caption beside
+it crisp — the field looks read, just wrong. `illumination_normalization_blur_divide` does
+exactly that to light blue ballpoint; see the measurement in `config/default_config.yaml`.
+When a handwritten field reads badly, compare the crop against the display image before
+touching prompts or models.
+
 **Deskew exists once.** There were three copies (the step, `grid_utils`,
 `temp/table_det.py`) and they disagreed. The survivor folds angles modulo 90 so vertical
 rules vote too, and expands the canvas so no corner is clipped.
@@ -312,12 +343,20 @@ rules vote too, and expands the canvas so no corner is clipped.
 
 ### Output formatters and persistence
 
-`output/formatters/ui_overlay_formatter.py` produces the JSON the desktop app consumes
-(`api-contract.md`'s response shape — label/value pairs with bboxes for the clickable
-overlay, plus the line-items table). `output/formatters/csv_formatter.py` produces the flat
-CSV view of the same structured data. `persistence/file_result_store.py` writes
+`output/formatters/invoice_json_formatter.py` produces the JSON the desktop app consumes —
+`../docs/api-contract.md`'s response shape, one named key per invoice field, each carrying
+a `bounding_box` for the clickable overlay. **The HTTP layer forces this formatter onto
+every request** (`api/routes.py`'s `WIRE_FORMATTER`): it *is* the documented response
+shape, so a configuration naming another one would return a body the desktop app cannot
+read while every other part of the request looked valid.
+
+The other two are for people, not for the app. `ui_overlay_formatter.py` is the lossless
+view — one entry per detected box, including text no invoice field claimed — and
+`csv_formatter.py` is the flat table. Either can be selected from a YAML file for a CLI
+run; neither is a valid `/extract` response. `persistence/file_result_store.py` writes
 `results/<invoice_id>/{result.json, display.png, preprocessing/<step-debug-images>}` — the
-audit trail; `write_debug_images`/`persist` are turned off for HTTP requests by default
+audit trail, which serializes the `PipelineResult` itself and is therefore unaffected by
+which formatter is configured; `write_debug_images`/`persist` are turned off for HTTP requests by default
 (`api/service_settings.py`) since writing one PNG per step per request would dominate
 request latency, and are off for the whole test session via `tests/conftest.py`.
 

@@ -67,20 +67,27 @@ class ExtractedValue:
         confidence: float,
         bbox: BoundingBox | None = None,
     ) -> "ExtractedValue":
-        """Build a field from a catalog match, falling back to the OCR text.
+        """Build a field from a catalog match, keeping the OCR text as the value.
 
-        The top candidate becomes the value only when it clears the review
-        threshold. Below it the OCR text stands and `requires_manual_review` is
-        set: a wrong confident match silently corrupts the invoice, while raw
-        text plus a ranked list leaves the user something to fix.
+        The raw reading **always** stands as `value`; a candidate never replaces
+        it, however well it scored. `candidates` is the answer, and choosing from
+        it is the desktop app's decision, made against its own threshold — see
+        the `original_value` + `results` shape in `docs/api-contract.md`. Two
+        sides applying the same threshold independently is one side too many: a
+        wrong confident match silently corrupts an invoice, and there is no way
+        to tell afterwards that a substitution happened.
+
+        `matched_to` / `matched_id` are still recorded when the top candidate
+        cleared the threshold, because the `results/` audit trail is worth being
+        able to read back. They are not on the wire.
         """
         best = match.best
         accepted = best is not None and not match.requires_manual_review
 
         return cls(
-            value=best.matched_value if accepted else (fallback_text or None),
+            value=fallback_text or None,
             confidence=confidence,
-            raw=fallback_text if accepted else None,
+            raw=None,
             matched_to=best.matched_value if accepted else None,
             matched_id=best.matched_id if accepted else None,
             matched_name=best.matched_name if accepted else None,

@@ -3,6 +3,11 @@
 These run the real pipeline -- real preprocessing, the deterministic stub OCR
 engine, real parsing and matching -- over a synthetic image, so a break
 anywhere between the upload and the JSON body fails here.
+
+Every test pins the pipeline to `single_engine` + `stub` through the request's
+own `config` part. The service's shipped default is `layout_driven` + `qwen`,
+which needs 1.7 GB of model weights and a second virtualenv; a test suite that
+loaded those would be untestable on any machine but this one.
 """
 
 from __future__ import annotations
@@ -17,6 +22,25 @@ import pytest
 from fastapi.testclient import TestClient
 
 from api.main import app
+
+# Exactly the keys the contract defines for a 200. Asserted as an equality, not
+# a subset: an extra key is a side of the contract drifting, and the desktop app
+# would ignore it silently rather than fail.
+RESPONSE_KEYS = {
+    "processing_ms",
+    "source",
+    "invoice_id",
+    "customer_name",
+    "date",
+    "city",
+    "products",
+    "total_invoice_price",
+    "enhanced_image_png",
+    "ocr_input_image_png",
+}
+
+VALUE_FIELD_KEYS = {"value", "ocr_confidence", "bounding_box"}
+MATCHED_FIELD_KEYS = {"bounding_box", "ocr_confidence", "original_value", "results"}
 
 
 @pytest.fixture(scope="module")
@@ -42,29 +66,49 @@ def invoice_png() -> bytes:
     return buffer.tobytes()
 
 
-def post_extract(client, image: bytes, options: dict | None = None, filename="invoice.png"):
-    files = {"file": (filename, io.BytesIO(image), "image/png")}
-    data = {"options": json.dumps(options)} if options is not None else None
-    return client.post("/api/v1/extract", files=files, data=data)
+def stub_config() -> dict:
+    """The service's defaults with the reading strategy swapped for the stub.
 
-
-STUB_OPTIONS = {"configuration": None}
-
-
-def with_stub_engine(options: dict | None = None) -> dict:
-    """Force the stub engine, so the tests never need Tesseract installed."""
+    Built from the shipped config rather than hand-written, so a preprocessing
+    change that would break a real request breaks these tests too.
+    """
     from api.pipeline_pool import PipelinePool
     from api.service_settings import get_settings
     from config.settings_contract import PipelineSettings
 
     pool = PipelinePool(get_settings().config_path)
     settings = PipelineSettings.from_app_config(pool.default_config)
+
+    # Both, not just the engine: under `layout_driven` no engine is consulted at
+    # all, so setting `ocr.engine` alone would still load the Qwen weights.
+    settings.flow.name = "single_engine"
     settings.ocr.engine = "stub"
     settings.ocr.engine_params = {}
 
-    merged = dict(options or {})
-    merged["configuration"] = settings.model_dump(mode="json")
-    return merged
+    return settings.model_dump(mode="json")
+
+
+def post_extract(
+    client,
+    image: bytes,
+    options: dict | None = None,
+    config: dict | None = None,
+    filename="invoice.png",
+):
+    """POST the three parts: the file, `options`, and `config`."""
+    files = {"file": (filename, io.BytesIO(image), "image/png")}
+
+    data = {}
+    if options is not None:
+        data["options"] = json.dumps(options)
+    if config is not None:
+        data["config"] = json.dumps(config)
+
+    return client.post("/api/v1/extract", files=files, data=data or None)
+
+
+def extract_with_stub(client, image: bytes, options: dict | None = None, **kwargs):
+    return post_extract(client, image, options=options, config=stub_config(), **kwargs)
 
 
 class TestHealth:
@@ -97,25 +141,36 @@ class TestDefaultConfiguration:
         for step in preprocessing.values():
             assert set(step) >= {"enabled", "algorithm", "params"}
 
+    def test_serves_the_flow_and_its_ocr_components(self, client):
+        """The settings page renders the reading strategy from this."""
+        body = client.get("/api/v1/configuration").json()
+
+        assert body["flow"]["name"] == "layout_driven"
+        assert body["ocr"]["recognizer"]["name"] == "qwen"
+        assert body["table_extraction"]["classifier"] == "bill_layout"
+
     def test_round_trips_back_into_extract(self, client, invoice_png):
         configuration = client.get("/api/v1/configuration").json()
-        response = post_extract(client, invoice_png, {"configuration": configuration})
+        response = post_extract(client, invoice_png, config=configuration)
+
+        # 503 when the Qwen weights are not loadable on this machine, which is
+        # the honest answer and not a contract break.
         assert response.status_code in (200, 503)
 
 
 class TestFileValidation:
     def test_rejects_an_unsupported_extension(self, client, invoice_png):
-        response = post_extract(client, invoice_png, filename="invoice.docx")
+        response = extract_with_stub(client, invoice_png, filename="invoice.docx")
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "UNSUPPORTED_FORMAT"
 
     def test_rejects_an_empty_upload(self, client):
-        response = post_extract(client, b"")
+        response = extract_with_stub(client, b"")
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "EMPTY_FILE"
 
     def test_rejects_bytes_that_are_not_an_image(self, client):
-        response = post_extract(client, b"this is not a png")
+        response = extract_with_stub(client, b"this is not a png")
         assert response.status_code == 400
         assert response.json()["error"]["code"] == "CORRUPT_FILE"
 
@@ -127,74 +182,131 @@ class TestFileValidation:
         assert response.status_code == 422
         assert response.json()["error"]["code"] == "INVALID_OPTIONS"
 
-    def test_rejects_an_invalid_configuration(self, client, invoice_png):
-        options = with_stub_engine()
-        options["configuration"]["preprocessing"]["thresholding"]["algorithm"] = "clahe"
-
-        response = post_extract(client, invoice_png, options)
-        assert response.status_code == 422
-        assert response.json()["error"]["code"] in (
-            "INVALID_OPTIONS", "INVALID_CONFIGURATION"
+    def test_rejects_malformed_config(self, client, invoice_png):
+        files = {"file": ("invoice.png", io.BytesIO(invoice_png), "image/png")}
+        response = client.post(
+            "/api/v1/extract", files=files, data={"config": "{not json"}
         )
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "INVALID_CONFIGURATION"
+
+    def test_rejects_an_invalid_config(self, client, invoice_png):
+        config = stub_config()
+        config["preprocessing"]["thresholding"]["algorithm"] = "clahe"
+
+        response = post_extract(client, invoice_png, config=config)
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "INVALID_CONFIGURATION"
+
+
+class TestRequestShape:
+    def test_config_is_its_own_part_not_nested_in_options(self, client, invoice_png):
+        """`configuration` inside `options` is the old shape and must not work.
+
+        Options ignore unknown keys, so a client still sending it there would get
+        a 200 running the *service's* configuration rather than its own -- the
+        silent kind of break this assertion exists to catch.
+        """
+        config = stub_config()
+
+        response = post_extract(client, invoice_png, options={"configuration": config})
+        assert response.status_code in (200, 503)
+
+        # Sent correctly, the stub always answers, which is what tells the two
+        # apart: the nested attempt above ran the default layout_driven pipeline.
+        assert post_extract(client, invoice_png, config=config).status_code == 200
+
+    def test_languages_and_invoice_type_are_no_longer_part_of_the_request(self):
+        from api.schemas import ExtractionOptions
+
+        fields = set(ExtractionOptions.model_fields)
+        assert "languages" not in fields
+        assert "invoice_type" not in fields
+        assert "configuration" not in fields
 
 
 class TestExtract:
-    def test_returns_the_documented_envelope(self, client, invoice_png):
-        response = post_extract(client, invoice_png, with_stub_engine())
-        assert response.status_code == 200
+    def test_returns_exactly_the_documented_keys(self, client, invoice_png):
+        response = extract_with_stub(client, invoice_png)
+        assert response.status_code == 200, response.json()
 
         body = response.json()
-        assert body["request_id"]
+        assert set(body) == RESPONSE_KEYS
+
         assert body["processing_ms"] >= 0
         assert body["source"]["filename"] == "invoice.png"
         assert body["source"]["width"] > 0
         assert body["source"]["height"] > 0
-        assert set(body["header"]) == {
-            "merchant_name", "invoice_number", "invoice_date", "city", "total_amount"
-        }
 
-    def test_every_field_uses_the_same_envelope(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
+    def test_value_fields_carry_a_reading_and_a_box(self, client, invoice_png):
+        body = extract_with_stub(client, invoice_png).json()
 
-        for name, field in body["header"].items():
-            assert set(field) >= {
-                "value", "confidence", "raw", "matched_to", "matched_id",
-                "matched_name", "match_score", "candidates",
-                "requires_manual_review", "bbox",
-            }, name
-            assert 0.0 <= field["confidence"] <= 1.0
+        for name in ("invoice_id", "date", "total_invoice_price"):
+            field = body[name]
+            assert set(field) == VALUE_FIELD_KEYS, name
+            assert 0.0 <= field["ocr_confidence"] <= 1.0
 
-    def test_line_items_carry_an_arithmetic_flag(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
+            if field["bounding_box"] is not None:
+                assert set(field["bounding_box"]) == {"x", "y", "w", "h"}
 
-        assert body["line_items"], "the stub engine always prints an item table"
-        for index, item in enumerate(body["line_items"]):
-            assert item["row_index"] == index
-            assert isinstance(item["arithmetic_ok"], bool)
-            assert set(item) >= {
-                "row_index", "product_name", "quantity", "unit_price",
-                "total_price", "arithmetic_ok",
+    def test_matched_fields_carry_the_original_reading_and_ranked_results(
+        self, client, invoice_png
+    ):
+        """The whole point of the shape: no `value` to be quietly wrong."""
+        body = extract_with_stub(client, invoice_png).json()
+
+        for name in ("customer_name", "city"):
+            field = body[name]
+            assert set(field) == MATCHED_FIELD_KEYS, name
+            assert "value" not in field, name
+
+    def test_products_carry_one_matched_name_and_three_values(self, client, invoice_png):
+        body = extract_with_stub(client, invoice_png).json()
+
+        assert body["products"], "the stub engine always prints an item table"
+
+        for product in body["products"]:
+            assert set(product) == {
+                "product_name", "quantity", "unit_price", "total_price"
             }
+            assert set(product["product_name"]) == MATCHED_FIELD_KEYS
+            for key in ("quantity", "unit_price", "total_price"):
+                assert set(product[key]) == VALUE_FIELD_KEYS
 
-    def test_quantities_are_integers_and_amounts_are_numbers(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
+    def test_amounts_are_json_numbers_and_quantities_are_integers(
+        self, client, invoice_png
+    ):
+        """Numbers, not formatted strings: the app parses them into `decimal`."""
+        body = extract_with_stub(client, invoice_png).json()
 
-        for item in body["line_items"]:
-            quantity = item["quantity"]["value"]
+        for product in body["products"]:
+            quantity = product["quantity"]["value"]
             if quantity is not None:
                 assert isinstance(quantity, int)
+
             for key in ("unit_price", "total_price"):
-                value = item[key]["value"]
+                value = product[key]["value"]
                 assert value is None or isinstance(value, (int, float))
 
+        total = body["total_invoice_price"]["value"]
+        assert total is None or isinstance(total, (int, float))
+
     def test_date_is_iso_or_null(self, client, invoice_png):
-        value = post_extract(client, invoice_png, with_stub_engine()).json()[
-            "header"]["invoice_date"]["value"]
+        value = extract_with_stub(client, invoice_png).json()["date"]["value"]
 
         if value is not None:
             assert len(value) == 10 and value[4] == "-" and value[7] == "-"
 
-    def test_a_known_merchant_is_matched_to_its_record(self, client, invoice_png):
+    def test_invoice_id_is_the_printed_number_not_the_run_id(self, client, invoice_png):
+        """A UUID here would mean the pipeline's own run id leaked onto the wire."""
+        value = extract_with_stub(client, invoice_png).json()["invoice_id"]["value"]
+
+        if value is not None:
+            assert "-" not in value or len(value) != 36
+
+    def test_a_known_merchant_appears_in_the_results_with_its_id(
+        self, client, invoice_png
+    ):
         # Every name the stub can print, so whichever it picks resolves.
         merchants = [
             {"customer_id": 1, "name": "متجر النور"},
@@ -204,60 +316,76 @@ class TestExtract:
             {"customer_id": 5, "name": "Gulf Office Supplies"},
         ]
 
-        body = post_extract(
-            client, invoice_png, with_stub_engine({"known_merchants": merchants})
+        body = extract_with_stub(
+            client, invoice_png, {"known_merchants": merchants}
         ).json()
 
-        merchant = body["header"]["merchant_name"]
-        assert merchant["matched_id"] in {1, 2, 3, 4, 5}
-        assert merchant["value"] == merchant["matched_to"]
-        assert not merchant["requires_manual_review"]
+        best = body["customer_name"]["results"][0]
+        assert best["id"] in {"1", "2", "3", "4", "5"}
+        assert best["string_matching_score"] >= 0.75
 
-    def test_candidates_are_ranked_and_capped(self, client, invoice_png):
+    def test_the_raw_reading_survives_a_confident_match(self, client, invoice_png):
+        """`original_value` is the paper, never the catalog entry that won."""
+        merchants = [{"customer_id": 1, "name": "متجر النور"}]
+
+        field = extract_with_stub(
+            client, invoice_png, {"known_merchants": merchants}
+        ).json()["customer_name"]
+
+        assert field["original_value"]
+
+    def test_results_are_ranked_capped_and_fractional(self, client, invoice_png):
         merchants = [{"customer_id": i, "name": f"متجر رقم {i}"} for i in range(20)]
 
-        body = post_extract(
-            client, invoice_png, with_stub_engine({"known_merchants": merchants})
-        ).json()
+        results = extract_with_stub(
+            client, invoice_png, {"known_merchants": merchants}
+        ).json()["customer_name"]["results"]
 
-        candidates = body["header"]["merchant_name"]["candidates"]
-        assert 0 < len(candidates) <= 5
+        assert 0 < len(results) <= 5
 
-        scores = [c["similarity_score"] for c in candidates]
+        scores = [entry["string_matching_score"] for entry in results]
         assert scores == sorted(scores, reverse=True)
-        assert all(0.0 <= s <= 100.0 for s in scores)
+
+        # A 0-1 fraction here, not the 0-100 percentage the matcher works in.
+        assert all(0.0 <= score <= 1.0 for score in scores)
 
     def test_max_candidates_is_honoured(self, client, invoice_png):
         merchants = [{"customer_id": i, "name": f"متجر رقم {i}"} for i in range(20)]
-        options = with_stub_engine(
-            {"known_merchants": merchants, "max_candidates": 2}
-        )
 
-        body = post_extract(client, invoice_png, options).json()
-        assert len(body["header"]["merchant_name"]["candidates"]) <= 2
+        body = extract_with_stub(
+            client, invoice_png, {"known_merchants": merchants, "max_candidates": 2}
+        ).json()
+
+        assert len(body["customer_name"]["results"]) <= 2
 
     def test_bare_name_strings_are_still_accepted(self, client, invoice_png):
-        options = with_stub_engine({"known_merchants": ["متجر النور"]})
-        assert post_extract(client, invoice_png, options).status_code == 200
+        options = {"known_merchants": ["متجر النور"]}
+        assert extract_with_stub(client, invoice_png, options).status_code == 200
 
     def test_an_unmatched_field_keeps_the_ocr_text(self, client, invoice_png):
-        options = with_stub_engine(
-            {"known_merchants": [{"customer_id": 99, "name": "لا شيء مشابه إطلاقا"}]}
-        )
-        merchant = post_extract(client, invoice_png, options).json()["header"]["merchant_name"]
+        options = {"known_merchants": [{"customer_id": 99, "name": "لا شيء مشابه إطلاقا"}]}
+        field = extract_with_stub(client, invoice_png, options).json()["customer_name"]
 
-        assert merchant["matched_id"] is None
-        assert merchant["requires_manual_review"]
-        assert merchant["value"], "OCR text must survive a failed match"
+        assert field["original_value"], "OCR text must survive a failed match"
+        assert all(
+            entry["string_matching_score"] < 0.75 for entry in field["results"]
+        )
+
+    def test_an_empty_catalog_leaves_the_text_with_no_results(self, client, invoice_png):
+        field = extract_with_stub(client, invoice_png).json()["customer_name"]
+
+        assert field["results"] == []
+        assert field["original_value"]
 
     def test_debug_images_are_absent_unless_requested(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
+        body = extract_with_stub(client, invoice_png).json()
         assert body["enhanced_image_png"] is None
         assert body["ocr_input_image_png"] is None
 
     def test_debug_images_are_downscaled_png(self, client, invoice_png):
-        options = with_stub_engine({"return_debug_images": True})
-        body = post_extract(client, invoice_png, options).json()
+        body = extract_with_stub(
+            client, invoice_png, {"return_debug_images": True}
+        ).json()
 
         for key in ("enhanced_image_png", "ocr_input_image_png"):
             encoded = body[key]
@@ -269,17 +397,27 @@ class TestExtract:
             assert decoded is not None
             assert decoded.shape[1] <= 1200
 
-    def test_overlay_elements_carry_boxes(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
+    def test_boxes_live_in_the_source_coordinate_space(self, client, invoice_png):
+        """Every box is measured against the corrected page the app displays."""
+        body = extract_with_stub(client, invoice_png).json()
+        width = body["source"]["width"]
+        height = body["source"]["height"]
 
-        assert body["elements"]
-        for element in body["elements"]:
-            assert len(element["bbox"]) == 4
-            assert element["kind"] in ("table_cell", "free_field")
+        def check(box, where):
+            if box is None:
+                return
+            assert 0 <= box["x"] <= width, where
+            assert 0 <= box["y"] <= height, where
+            assert box["w"] >= 0 and box["h"] >= 0, where
 
-    def test_raw_text_is_returned(self, client, invoice_png):
-        body = post_extract(client, invoice_png, with_stub_engine()).json()
-        assert body["raw_text"].strip()
+        for name in ("invoice_id", "date", "total_invoice_price"):
+            check(body[name]["bounding_box"], name)
+        for name in ("customer_name", "city"):
+            check(body[name]["bounding_box"], name)
+
+        for index, product in enumerate(body["products"]):
+            for key in ("product_name", "quantity", "unit_price", "total_price"):
+                check(product[key]["bounding_box"], f"products[{index}].{key}")
 
     def test_a_borderless_page_still_extracts(self, client):
         """A receipt with no ruled lines or page edge is a normal invoice.
@@ -294,22 +432,23 @@ class TestExtract:
         ok, buffer = cv2.imencode(".png", page)
         assert ok
 
-        response = post_extract(client, buffer.tobytes(), with_stub_engine())
+        response = extract_with_stub(client, buffer.tobytes())
 
         assert response.status_code == 200, response.json()
-        assert response.json()["line_items"]
+        assert response.json()["products"]
 
     def test_a_blank_page_does_not_crash(self, client):
         page = np.full((900, 700, 3), 255, dtype=np.uint8)
         ok, buffer = cv2.imencode(".png", page)
         assert ok
 
-        response = post_extract(client, buffer.tobytes(), with_stub_engine())
+        response = extract_with_stub(client, buffer.tobytes())
         assert response.status_code == 200, response.json()
 
     def test_the_same_file_extracts_identically(self, client, invoice_png):
-        first = post_extract(client, invoice_png, with_stub_engine()).json()
-        second = post_extract(client, invoice_png, with_stub_engine()).json()
+        first = extract_with_stub(client, invoice_png).json()
+        second = extract_with_stub(client, invoice_png).json()
 
-        assert first["header"] == second["header"]
-        assert first["line_items"] == second["line_items"]
+        for key in ("invoice_id", "customer_name", "date", "city", "products",
+                    "total_invoice_price"):
+            assert first[key] == second[key], key

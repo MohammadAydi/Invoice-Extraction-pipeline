@@ -25,6 +25,7 @@ from core.exceptions import NotImplementedStrategyError
 from core.domain.invoice import InvoiceDraft, InvoiceWarning, WarningCodes
 from core.domain.catalog import Catalogs
 from invoice.parser import InvoiceParser
+from invoice.reconciliation import reconcile
 from mapping.cell_mapper import CellMapper
 from orchestration.flows.factory import build_flow
 from orchestration.page_debug import PageDebugWriter
@@ -206,6 +207,14 @@ class PipelineOrchestrator:
             lambda: self.invoice_parser.parse(structured_doc, ocr_result, catalogs),
             lambda: InvoiceDraft(),
         )
+
+        # 6b. Arithmetic reconciliation. The recognizers misplace the decimal
+        #     separator far more often than they misread a digit, so every legal
+        #     separator position is tried and the one that satisfies
+        #     price x quantity = total is kept. It runs on the parsed draft
+        #     rather than inside the parser because it is a property of the
+        #     three numbers together, not of any one cell.
+        invoice = reconcile(invoice)
 
         # A flow that could not do its job says so on the wire, not only in the
         # log. "layout_driven found no grid" and "this invoice is blank" produce
