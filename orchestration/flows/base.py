@@ -60,12 +60,10 @@ class ExtractionFlow(ABC):
 
     name: str = "extraction_flow"
 
-    def __init__(self, table_extractor, layout_classifier, cell_mapper,
-                 debug_writer=None):
+    def __init__(self, table_extractor, layout_classifier, cell_mapper):
         self.table_extractor = table_extractor
         self.layout_classifier = layout_classifier
         self.cell_mapper = cell_mapper
-        self.debug_writer = debug_writer
 
     # -- the template ---------------------------------------------------
 
@@ -158,12 +156,12 @@ class ExtractionFlow(ABC):
         crop_s = time.perf_counter() - started
 
         started = time.perf_counter()
-        if self.debug_writer is not None and hasattr(self.recognizer, "read"):
+        if debug is not None:
             texts, read_times = [], []
             for crop in crops:
                 t0 = time.perf_counter()
                 texts.append(self.recognizer.read(crop))
-                read_times.append(time.perf_counter() - t0)
+                read_times.append(round(time.perf_counter() - t0, 3))
         else:
             texts = self.recognizer.read_all(crops)
             read_times = None
@@ -175,12 +173,9 @@ class ExtractionFlow(ABC):
                 f"results for {len(crops)} crops; callers index one against the other."
             )
 
-        if self.debug_writer is not None:
+        if debug is not None:
             try:
-                self.debug_writer.write(
-                    payload.image, crops, texts,
-                    engine_name=engine_name, read_times=read_times,
-                )
+                debug.write(payload.image, crops, texts, read_times=read_times)
             except Exception as exc:  # noqa: BLE001
                 # Debug output is never worth failing a run for.
                 logger.warning("Debug output failed (%s); continuing.", exc)
@@ -198,8 +193,6 @@ class ExtractionFlow(ABC):
             for crop, text in zip(crops, texts)
         ]
 
-        if debug is not None:
-            debug.write(payload.image, crops, texts)
         logger.info(
             "%s: %d region(s) -> %d crop(s) in %.2fs, read in %.2fs (%.3fs/crop)",
             self.name,

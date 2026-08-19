@@ -39,6 +39,8 @@ class PaddedRegionCropper:
         pad: int = 10,
         upscale: int = 2,
         min_side: int = 8,
+        min_ink_ratio: float = 0.0,
+        ink_delta: int = 30,
         **params,
     ):
         if upscale < 1:
@@ -46,7 +48,15 @@ class PaddedRegionCropper:
         self.pad = pad
         self.upscale = upscale
         self.min_side = min_side
+        self.min_ink_ratio = float(min_ink_ratio)
+        self.ink_delta = int(ink_delta)
+
         self.params = params
+
+    def ink_ratio(self, patch: np.ndarray) -> float:
+        gray = patch if patch.ndim == 2 else patch[..., :3].mean(axis=2)
+        paper = np.percentile(gray, 85)
+        return float((gray < paper - self.ink_delta).mean())
 
     def crop(
         self, image: ImagePayload, regions: Sequence[TextRegion]
@@ -67,6 +77,8 @@ class PaddedRegionCropper:
 
             patch = page[y1:y2, x1:x2]
             if patch.size == 0:
+                continue
+            if self.min_ink_ratio > 0 and self.ink_ratio(patch) < self.min_ink_ratio:
                 continue
 
             if self.upscale > 1:

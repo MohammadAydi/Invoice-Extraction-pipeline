@@ -75,21 +75,42 @@ class PageDebugWriter:
 
     # -- the one method flows call --------------------------------------
 
-    def write(self, page: np.ndarray, crops: Sequence, texts: Sequence[str]) -> Path | None:
+    def write(
+        self,
+        page: np.ndarray,
+        crops: Sequence,
+        texts: Sequence[str],
+        read_times: Sequence[float] | None = None,
+    ) -> Path | None:
         """Records this page. Never raises: debug output must not fail a run.
 
         `crops` are RegionCrop objects and `texts` the recognizer's replies,
-        index-aligned -- the caller has already checked that.
+        index-aligned -- the caller has already checked that. `read_times`,
+        when given, is index-aligned the same way and recorded per row as
+        `read_time_s`; omit it (or pass None) when the caller took the batched
+        `read_all` path and has no per-crop timing to report.
         """
         try:
-            return self._write(page, crops, texts)
+            return self._write(page, crops, texts, read_times)
         except Exception as exc:  # noqa: BLE001
             logger.warning("Debug output failed (%s); the run itself is unaffected.", exc)
             return None
 
-    def _write(self, page: np.ndarray, crops: Sequence, texts: Sequence[str]) -> Path:
+    def _write(
+        self,
+        page: np.ndarray,
+        crops: Sequence,
+        texts: Sequence[str],
+        read_times: Sequence[float] | None,
+    ) -> Path:
         out_dir = self.out_dir
         rows = []
+
+        if read_times is not None and len(read_times) != len(crops):
+            raise ValueError(
+                f"read_times has {len(read_times)} entries for {len(crops)} crops; "
+                "they must be index-aligned."
+            )
 
         for index, (crop, text) in enumerate(zip(crops, texts), start=1):
             filename = f"{index:03d}.png"
@@ -111,6 +132,9 @@ class PageDebugWriter:
                 # the same signal the old engine wrote as `box is None`.
                 "synthesised": region.confidence is None,
                 "source_id": region.source_id,
+                "read_time_s": (
+                    round(read_times[index - 1], 3) if read_times is not None else None
+                ),
             })
 
         cv2.imwrite(str(out_dir / "_page.png"), page)
