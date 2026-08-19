@@ -7,7 +7,9 @@ from datetime import date
 import pytest
 
 from string_matching.normalization import (
+    digit_sequence,
     fold_digits,
+    fold_latin_lookalikes,
     format_date,
     normalize_date_text,
     normalize_price,
@@ -181,3 +183,58 @@ class TestDates:
     def test_format_is_iso(self):
         assert format_date(date(2026, 3, 14)) == "2026-03-14"
         assert format_date(None) is None
+
+
+class TestLatinLookalikes:
+    """The three digit-to-letter mis-readings the VLM recognizers make.
+
+    Measured on this project's own invoices and documented in the project log;
+    the map is deliberately not extended past them. Every product name passes
+    through the same normalizer, and folding a fourth letter on a hunch would
+    corrupt real text to fix a mis-reading nobody has seen.
+    """
+
+    @pytest.mark.parametrize(
+        "raw, expected",
+        [
+            ("O", "5"),
+            ("o", "5"),
+            ("V", "7"),
+            ("v", "7"),
+            ("A", "8"),
+            ("1O5", "155"),
+            # Anything else is left exactly as it was.
+            ("B", "B"),
+            ("سكر", "سكر"),
+            ("", ""),
+        ],
+    )
+    def test_folds_only_the_documented_three(self, raw, expected):
+        assert fold_latin_lookalikes(raw) == expected
+
+    def test_handles_none(self):
+        assert fold_latin_lookalikes(None) == ""
+
+
+class TestDigitSequence:
+    """The reading a numeric cell is most likely to have got right.
+
+    These recognizers misplace separators far more often than they misread a
+    digit, so the bare sequence is what invoice.reconciliation searches decimal
+    positions over.
+    """
+
+    def test_strips_the_noise_a_dot_pattern_adds(self):
+        # A real reading: the crop caught the printed dot leader between the
+        # digits. The sequence is 517.65 exactly right.
+        assert digit_sequence("٥-١-٧,٦,٥") == "51765"
+
+    def test_folds_arabic_indic_digits(self):
+        assert digit_sequence("١٢٣") == "123"
+
+    def test_folds_latin_lookalikes_first(self):
+        assert digit_sequence("1O5") == "155"
+
+    def test_a_cell_with_no_digits_is_empty(self):
+        assert digit_sequence("ثلاثون") == ""
+        assert digit_sequence(None) == ""

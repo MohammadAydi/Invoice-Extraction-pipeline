@@ -55,7 +55,7 @@ mapping/            CellMapper: OCR fragments + table cells -> StructuredDocumen
 string_matching/    Normalization, the two similarity algorithms, catalog matching,
                      and the keyword-dictionary matcher adapters + factory
 invoice/            The semantic layer: elements -> header fields + line items + warnings
-output/             Formatter adapters (ui_overlay_json, csv) + factory
+output/             Formatter adapters (invoice_json, ui_overlay_json, csv) + factory
 persistence/        ResultStore adapter (file_result_store) for audit/reproducibility
 orchestration/      PipelineOrchestrator: the one module that knows the full pipeline shape
 tests/              pytest suite, including end-to-end tests of the HTTP contract
@@ -101,7 +101,7 @@ Everything is normalized first (`string_matching/normalization.py`): Arabic-Indi
 folded to ASCII, diacritics and tatweel removed, أ/إ/آ→ا, ى→ي, ة→ه, punctuation stripped,
 whitespace collapsed, case folded. Digits survive — they are part of real product names.
 
-**These rules are mirrored in `InvoiceDigitizationApp/Helpers/{TextNormalizer,FuzzyMatch}.cs`.**
+**These rules live here alone.** The C# copies in `InvoiceDigitizationApp/Helpers/{TextNormalizer,FuzzyMatch,CatalogMatcher}.cs` are deleted: two implementations of "the same string" made the answer depend on which side computed it.
 The C# copies exist because the app re-matches locally when the service returned no
 candidates. If one side changes, the other must change with it.
 

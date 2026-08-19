@@ -286,7 +286,10 @@ class InvoiceParser:
             item.quantity = ExtractedValue(
                 value=value,
                 confidence=_cell_confidence([quantity]) if value is not None else 0.0,
-                raw=raw if value is not None and str(value) != raw else None,
+                # Kept whenever it differs from the parse -- including when there
+                # was no parse. A cell the number rules rejected is exactly what
+                # invoice.reconciliation reads the digits back out of.
+                raw=raw if raw and str(value) != raw else None,
                 bbox=quantity.bbox,
             )
 
@@ -305,7 +308,9 @@ class InvoiceParser:
                 ExtractedValue(
                     value=round(float(value), 2) if value is not None else None,
                     confidence=_cell_confidence([cell]) if value is not None else 0.0,
-                    raw=raw if value is not None else None,
+                    # As above: a reading the strict parser refused ("5-1-7,6,5")
+                    # still carries the right digits, and reconciliation needs them.
+                    raw=raw or None,
                     bbox=cell.bbox,
                 ),
             )
@@ -473,9 +478,12 @@ class InvoiceParser:
         confidences = [_cell_confidence([cell]) for cell, _ in numeric]
 
         item.quantity = _quantity_field(columns.quantity_index, texts, boxes, confidences)
-        item.unit_price = _price_field(columns.unit_price_index, values, boxes, confidences)
+        item.unit_price = _price_field(
+            columns.unit_price_index, values, boxes, confidences, texts=texts
+        )
         item.total_price = _price_field(
-            columns.total_index, values, boxes, confidences, derived=columns.derived_total
+            columns.total_index, values, boxes, confidences,
+            derived=columns.derived_total, texts=texts,
         )
 
         item.arithmetic_ok = _arithmetic_ok(
@@ -536,9 +544,12 @@ class InvoiceParser:
         confidences = [w.confidence for w in number_words]
 
         item.quantity = _quantity_field(columns.quantity_index, texts, boxes, confidences)
-        item.unit_price = _price_field(columns.unit_price_index, values, boxes, confidences)
+        item.unit_price = _price_field(
+            columns.unit_price_index, values, boxes, confidences, texts=texts
+        )
         item.total_price = _price_field(
-            columns.total_index, values, boxes, confidences, derived=columns.derived_total
+            columns.total_index, values, boxes, confidences,
+            derived=columns.derived_total, texts=texts,
         )
 
         item.arithmetic_ok = _arithmetic_ok(
@@ -812,8 +823,14 @@ def _price_field(
     boxes: list[BoundingBox],
     confidences: list[float],
     derived: float | None = None,
+    texts: list[str] | None = None,
 ) -> ExtractedValue:
-    """A monetary cell, or a value derived from the other two."""
+    """A monetary cell, or a value derived from the other two.
+
+    `texts` is the cell as it was read, kept on `raw` so
+    :mod:`invoice.reconciliation` can see the separator run and the trailing
+    dots -- both of which the parsed float has already thrown away.
+    """
     if index is None or index >= len(values):
         if derived is None:
             return ExtractedValue()
@@ -822,9 +839,12 @@ def _price_field(
         # confidence of its own -- and must not claim either.
         return ExtractedValue(value=round(derived, 2), confidence=0.0)
 
+    raw = texts[index] if texts is not None and index < len(texts) else None
+
     return ExtractedValue(
         value=round(float(values[index]), 2),
         confidence=confidences[index] if index < len(confidences) else 0.0,
+        raw=raw,
         bbox=boxes[index] if index < len(boxes) else None,
     )
 

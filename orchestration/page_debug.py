@@ -6,7 +6,7 @@ pipeline that answers "which crop produced that string", and without it tuning
 is guesswork: a wrong reading tells you nothing unless you can see the pixels
 the model was actually handed.
 
-It also produces `results.json`, which `postprocess/reconcile.py` consumes.
+It also produces `results.json`, a flat dump of the boxes for eyeballing a run. `postprocess/reconcile.py` used to consume it; the arithmetic repair it did now runs inside the pipeline as `invoice/reconciliation.py`, against the parsed invoice rather than against a file written on the side.
 That file is not merely a convenience. `OCRFragment` carries text, bbox,
 confidence and source_id -- but not `content_kind`, and nothing at all marks a
 region the refiner synthesised. Both are needed to reconcile a row

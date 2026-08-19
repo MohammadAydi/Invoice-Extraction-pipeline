@@ -6,6 +6,7 @@ import base64
 import io
 import json
 import os
+from pathlib import Path
 
 import numpy as np
 from PIL import Image
@@ -39,6 +40,28 @@ PROMPTS = {
     "any": "اقرأ النص في هذه الصورة كاملاً من البداية إلى النهاية.",
 }
 
+# The pipeline root, for anchoring the worker paths below. Three parents up:
+# ocr/engines/qwen_vlm_engine.py -> ocr/engines -> ocr -> the project.
+PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+
+
+def _resolve_local(path: str) -> str:
+    """An OS-native absolute path for a config value written project-relative.
+
+    Two separate problems, one fix. The YAML says `qwen_venv/Scripts/python.exe`,
+    and on Windows **CreateProcess refuses a relative path written with forward
+    slashes** -- ``os.path.exists`` says the file is there and ``Popen`` still
+    raises ``FileNotFoundError [WinError 2]``, which reads exactly like a missing
+    virtualenv. And the service is started from wherever the desktop app happens
+    to launch it, so a relative path would be resolved against the wrong
+    directory anyway.
+    """
+    candidate = Path(path)
+    if not candidate.is_absolute():
+        candidate = PROJECT_ROOT / candidate
+    return str(candidate)
+
+
 MAX_SIDE = 768   # the model card's own prepare_image cap
 MULTIPLE = 64    # the model requires both dimensions to be multiples of 64
 
@@ -64,24 +87,24 @@ def fit_for_model(img: Image.Image) -> Image.Image:
 class QwenVLMEngine:
     def __init__(
         self,
-        model_path: str = r"models\qwen",
+        model_path: str = r"models/qwen",
         backend: str = "http",
         host: str = "http://localhost:11434",
         model_name: str = "arabic-ocr",
         kind: str = "any",
         max_new_tokens: int = 64,
-        worker_python: str = r"qwen_venv\Scripts\python.exe",
+        worker_python: str = r"qwen_venv/Scripts/python.exe",
         worker_script: str = "tools/qwen_worker.py",
         **engine_params,
     ):
-        self.model_path = model_path
+        self.model_path = _resolve_local(model_path)
         self.backend = backend
         self.host = host.rstrip("/")
         self.model_name = model_name
         self.kind = kind
         self.max_new_tokens = max_new_tokens
-        self.worker_python = worker_python
-        self.worker_script = worker_script
+        self.worker_python = _resolve_local(worker_python)
+        self.worker_script = _resolve_local(worker_script)
 
         self._proc = None
         if backend == "transformers":

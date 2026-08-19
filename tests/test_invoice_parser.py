@@ -66,10 +66,16 @@ class TestHeader:
         )
 
         draft = InvoiceParser().parse(free_document(result), result, catalogs)
+        merchant = draft.header.merchant_name
 
-        assert draft.header.merchant_name.value == "مؤسسة النور التجارية"
-        assert draft.header.merchant_name.matched_id == 12
-        assert draft.header.merchant_name.candidates
+        # The OCR text stands as the value even on a confident match: the
+        # catalog entry that won is reported alongside it, never in place of
+        # it. The desktop app decides, against its own threshold.
+        assert merchant.value == "مؤسسه النـور التجارية"
+        assert merchant.matched_id == 12
+        assert merchant.matched_to == "مؤسسة النور التجارية"
+        assert not merchant.requires_manual_review
+        assert merchant.candidates
 
     def test_merchant_falls_back_to_ocr_text_with_candidates_attached(self):
         result = ocr(fragment("متجر", 400, 40), fragment("الياسمين", 320, 40))
@@ -288,8 +294,10 @@ class TestLineItemsFromTableCells:
         assert len(draft.line_items) == 1
         item = draft.line_items[0]
 
-        # Matched order-independently against the catalog.
-        assert item.product_name.value == "جاكيت صوف أزرق"
+        # Matched order-independently against the catalog, and reported without
+        # overwriting what the paper said.
+        assert item.product_name.value == "جاكيت ازرق صوف"
+        assert item.product_name.matched_to == "جاكيت صوف أزرق"
         assert item.product_name.matched_id == 31
 
         # Arabic-Indic quantity folded to an integer.

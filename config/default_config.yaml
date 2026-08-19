@@ -12,13 +12,38 @@ preprocessing:
     - {name: perspective_correction, enabled: true, params: {canny_low: 30, canny_high: 150}}
     - {name: deskew_hough, enabled: true, params: {hough_threshold: 100, min_line_length: 150, max_line_gap: 10, max_angle_deg: 20}}
 
+  # Everything after illumination normalization is deliberately OFF: the Qwen
+  # recognizer reads a grayscale crop far better than a binarized one, and
+  # thresholding a handwritten stroke is what breaks it into pieces. The steps
+  # stay listed with their parameters so the settings page has something to
+  # render and switching one back on is a toggle, not an edit.
+  #
+  # `illumination_normalization_blur_divide` is the next candidate to turn off,
+  # and the first thing to try when a handwritten field reads badly. Measured on
+  # images/test1.jpg, date cell (805, 462, 443, 158), same model and prompt, the
+  # only variable being which image the crop came from:
+  #
+  #     corrected page   ->  'التاريخ : ٧ / ٨ / ٢٠٢٦'   correct
+  #     after blur-divide->  'التاريخ : /٨/ ٧)'          day and year destroyed
+  #
+  # Blur-divide flattens the page against a blurred copy of itself, which makes
+  # dark print pop and washes light blue ballpoint out to a pale grey the model
+  # then drops components of. It was tuned for a binarizing engine reading
+  # printed text; this pipeline feeds a VLM reading grayscale directly. The
+  # printed caption in the same cell survived it either way, which is why the
+  # damage is easy to miss -- the field looks read, just wrong.
+  #
+  # Not switched off here because that was measured per cell, not across a whole
+  # invoice, and the step exists for the phone-photo shadows this product is
+  # full of. It is one `enabled:` flag, and the settings page exposes it, so it
+  # can be A/B'd on a real batch without a rebuild.
   ocr_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
     - {name: illumination_normalization_blur_divide, enabled: true, params: {blur_kernel: 95}}
-    - {name: clahe, enabled: true, params: {clip_limit: 2.5, tile_grid_size: [8, 8]}}
-    - {name: bilateral_filter, enabled: true, params: {d: 20, sigma_color: 25, sigma_space: 50}}
-    - {name: adaptive_threshold, enabled: true, params: {block_size: 51, c: 35}}
-    - {name: morphological_cleanup, enabled: true, params: {operation: open, kernel_size: 2}}
+    - {name: clahe, enabled: false, params: {clip_limit: 2.0, tile_grid_size: [8, 8]}}
+    - {name: bilateral_filter, enabled: false, params: {d: 5, sigma_color: 50, sigma_space: 50}}
+    - {name: adaptive_threshold, enabled: false, params: {block_size: 51, c: 35}}
+    - {name: morphological_cleanup, enabled: false, params: {operation: open, kernel_size: 2}}
 
   table_photometric_steps:
     - {name: channel_selection, enabled: true, params: {channel: gray}}
@@ -27,25 +52,43 @@ preprocessing:
     # reconstruct the paper instead of the rules.
     - {name: adaptive_threshold, enabled: true, params: {block_size: 15, c: 10, invert: true}}
 
+# Layout first: the printed grid is detected and classified, then every labelled
+# cell is cropped and read with the prompt its role implies. No text detector
+# runs. This is the configuration that actually works on this project's
+# handwritten invoices -- `single_engine` + `tesseract` was the default before,
+# and Tesseract is a separate binary install that reads this handwriting poorly.
+# See orchestration/flows/layout_driven.py.
+flow:
+  name: layout_driven
+
 ocr:
-  engine: tesseract
-  engine_params: {lang: ara}
+  cropper:
+    name: padded_crop
+    params: {pad: 10, upscale: 2, min_side: 8}
+
+  recognizer:
+    name: qwen
+    params:
+      backend: subprocess
+      worker_python: "qwen_venv/Scripts/python.exe"
+      worker_script: "tools/qwen_worker.py"
+      model_path: "models/qwen"
+      arch: qwen2_5_vl
+      max_new_tokens: 64
+      default_kind: any
 
 table_extraction:
-  extractor: grid_line
-  extractor_params:
-    dot_bridge_scale: 150
-    main_kernel_scale: 30
-    min_line_length_ratio: 0.05
-    intersection_tolerance: 15
-    merge_proximity: 15
-    min_extend_length_ratio: 0.5
-    coverage_ratio: 0.5
-    # Off by default. This writes cells_detected.png into the working directory
-    # every time a table is extracted, which under the HTTP service means once
-    # per invoice into whatever folder the desktop app happened to launch from.
-    # Turn it on while tuning the grid parameters from the CLI, not in service.
-    save_debug_images: false
+  # The grid supplies the column boundaries, measured on each photograph, so
+  # nothing has to be declared -- and nothing can be wrong when a page is
+  # cropped differently.
+  extractor: contour_based
+  extractor_params: {}
+  classifier: bill_layout
+  classifier_params:
+    table_row_count: 10
+    table_col_count: 6
+    # Left to right, as the columns of this RTL form appear in pixel order.
+    column_roles: [notes, line_total, unit_price, quantity, product_name, line_number]
 
 string_matching:
   algorithm: levenshtein
@@ -53,7 +96,12 @@ string_matching:
   dictionary_path: "keywords/ar_invoice_terms.json"
 
 output:
-  formatter: ui_overlay_json
+  # The shape the desktop app binds to, one named key per invoice field. The
+  # HTTP layer forces this one anyway -- it IS the documented response shape --
+  # so the CLI printing something else would just be a second thing to reason
+  # about. `ui_overlay_json` is still registered for the lossless box-by-box
+  # view; `results/<id>/result.json` carries that view regardless of formatter.
+  formatter: invoice_json
   formatter_params: {}
 
 persistence:

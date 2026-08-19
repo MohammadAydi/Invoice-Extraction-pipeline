@@ -21,7 +21,7 @@ from core.domain.image_payload import ImagePayload
 from orchestration.pipeline_orchestrator import PipelineOrchestrator
 
 
-def main(image_path: str, config_path: str = "config/qwen_detector_config.yaml") -> None:
+def main(image_path: str, config_path: str = "config/qwen_config.yaml") -> None:
     config = load_config(config_path)
     orchestrator = PipelineOrchestrator(config)
 

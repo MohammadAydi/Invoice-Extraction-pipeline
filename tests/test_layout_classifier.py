@@ -124,6 +124,63 @@ class TestBillLayout:
         assert len(layout.with_role(CellRole.MERCHANT_NAME)) == 1
         assert merchant.bbox.h > 24  # the real field box, not a letterhead sliver
 
+    def test_a_stray_box_above_the_header_does_not_steal_the_invoice_number(self):
+        """The same class of bug, one field over.
+
+        The invoice number used to be scored within the *topmost* header row.
+        A row holding a single stray cell normalizes to zero on both axes --
+        `max(range, 1.0)` divided into a spread of zero -- so that cell won by
+        default and its position was never consulted. Scoring across the whole
+        header block is what makes the corner mean something.
+        """
+        table = standard_form()
+        cells = list(table.tables[0].cells)
+        cells.append(cell(900, 10, 120, 24, 0, 0))
+        cells.append(cell(1040, 10, 120, 24, 0, 1))
+
+        patched = TableExtractionResult(
+            tables=[
+                TableStructure(
+                    table_id=TABLE_ID, bbox=table.tables[0].bbox, cells=cells
+                )
+            ],
+            extractor_name="test",
+        )
+
+        region = classify(patched).first_with_role(CellRole.INVOICE_NUMBER)
+
+        assert (region.bbox.x, region.bbox.y) == (60, 40)
+
+    def test_a_lone_page_edge_sliver_does_not_steal_the_invoice_number(self):
+        """Measured off `images/test1.jpg`, which is where this was found.
+
+        A 71x222 sliver of the page edge closed as its own contour at the very
+        top right. It clustered alone, took INVOICE_NUMBER, was cropped and read
+        with the free-text prompt, and came back as an invented Arabic sentence
+        -- while the box holding "رقم الفاتورة : 00010" stayed unlabelled.
+        """
+        table = standard_form()
+        cells = list(table.tables[0].cells)
+        # Scaled to this fixture's geometry: far right, above the header row,
+        # and far enough above it to cluster on its own.
+        cells.append(cell(1180, 8, 40, 120, 0, 0))
+
+        patched = TableExtractionResult(
+            tables=[
+                TableStructure(
+                    table_id=TABLE_ID, bbox=table.tables[0].bbox, cells=cells
+                )
+            ],
+            extractor_name="test",
+        )
+
+        layout = classify(patched)
+        region = layout.first_with_role(CellRole.INVOICE_NUMBER)
+
+        assert (region.bbox.x, region.bbox.y) == (60, 40)
+        # And the sliver is left unlabelled rather than given some other field.
+        assert len(layout.with_role(CellRole.INVOICE_NUMBER)) == 1
+
     def test_the_column_header_row_is_labelled_as_such(self):
         layout = classify()
         headers = layout.with_role(CellRole.COLUMN_HEADER)

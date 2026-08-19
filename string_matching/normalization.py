@@ -1,10 +1,12 @@
 """Pre-processing applied to every string before it reaches a matcher.
 
 Matching Arabic OCR output against a catalog only works if both sides are first
-reduced to the same canonical form. The rules here are the ones agreed with the
-desktop team and mirrored in ``InvoiceDigitizationApp/Helpers/TextNormalizer.cs``;
-if one side changes, the other has to change with it or the two will disagree on
-what "the same string" means.
+reduced to the same canonical form. These rules are the only implementation of
+them: the desktop app used to mirror them in
+``InvoiceDigitizationApp/Helpers/TextNormalizer.cs`` so it could re-match locally,
+and that copy is deleted. Nothing here has to be kept in step with a second
+version any more, which is the point -- the two drifted, invisibly, and a
+merchant the service had matched came back unmatched in the app.
 
 Three separate normalizations live here because they have genuinely different
 rules:
@@ -42,6 +44,29 @@ _DIGIT_MAP = {
 def fold_digits(text: str) -> str:
     """Arabic-Indic digits to ASCII, leaving every other character alone."""
     return text.translate(_DIGIT_MAP)
+
+
+# The VLM recognizers translate a handwritten digit into the Latin letter it
+# looks like. Only the three that were actually measured on this project's
+# invoices are folded -- adding more on a hunch would corrupt product names,
+# which pass through the same normalizer.
+_LATIN_LOOKALIKES = str.maketrans({"O": "5", "o": "5", "V": "7", "v": "7", "A": "8"})
+
+
+def fold_latin_lookalikes(text: str | None) -> str:
+    """Undo the three documented digit-to-Latin-letter mis-readings."""
+    return (text or "").translate(_LATIN_LOOKALIKES)
+
+
+def digit_sequence(text: str | None) -> str:
+    """Every digit in `text`, in order, with nothing else.
+
+    The reading a numeric cell is most likely to have got *right*: these models
+    misplace separators far more often than they misread a digit, so the bare
+    sequence is what the arithmetic reconciliation searches decimal positions
+    over. See :mod:`invoice.reconciliation`.
+    """
+    return re.sub(r"\D", "", fold_latin_lookalikes(fold_digits(text or "")))
 
 
 # --------------------------------------------------------------------------

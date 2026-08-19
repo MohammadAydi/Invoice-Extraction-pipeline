@@ -4,83 +4,98 @@ These are the Python half of `docs/api-contract.md`; the C# DTOs in
 `InvoiceDigitizationApp/Services/AiServiceClient/Contracts.cs` are the other
 half. Change the document first, then both sides. Unknown JSON fields are
 ignored by both, so additive changes stay backward-compatible.
+
+Two field shapes, and which one a field gets is the contract's central decision:
+
+* :class:`ValueField` -- one reading, its confidence, its box. For anything
+  there is no catalog to match against.
+* :class:`MatchedField` -- **no** ``value`` at all. The raw OCR text under
+  ``original_value``, plus the ranked catalog entries under ``results``. The
+  desktop app picks, against its own threshold. A wrong confident match
+  silently corrupts an invoice, so the shape refuses to make that call rather
+  than relying on both sides to agree not to.
 """
 
 from __future__ import annotations
 
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-from config.settings_contract import PipelineSettings
 
 T = TypeVar("T")
 
 # Fields scoring below this are flagged for human review rather than rejected.
+# The desktop app applies it; the service reports the scores that feed it.
 REVIEW_CONFIDENCE_THRESHOLD = 0.75
 
 
-class MatchCandidate(BaseModel):
-    """One entry of a field's ranked candidate list.
-
-    `similarity_score` is a **percentage**, 0-100, rounded to two places -- the
-    shape the matching spec defines and the one the desktop app displays beside
-    each dropdown entry. The field-level `match_score` is the same number as a
-    0-1 fraction, kept for the confidence rendering that already works that way.
+class BoundingBox(BaseModel):
+    """Origin plus size, in the coordinate space of the geometrically corrected
+    page -- the same space `source.width` x `source.height` describes, and the
+    same one every box in the response lives in.
     """
 
     model_config = ConfigDict(extra="ignore")
 
-    matched_value: str
-    similarity_score: float = Field(ge=0.0, le=100.0)
-
-    # Primary key of the catalog record, when the candidate came from one.
-    matched_id: int | None = None
-
-    # The specific name that scored, when it differs from the canonical value.
-    matched_name: str | None = None
+    x: int = 0
+    y: int = 0
+    w: int = 0
+    h: int = 0
 
 
-class ExtractedField(BaseModel, Generic[T]):
-    """Envelope shared by every extracted value.
+class MatchResultEntry(BaseModel):
+    """One ranked catalog entry for a matched field."""
 
-    A uniform shape lets the desktop UI render confidence the same way for
-    every field instead of special-casing each one.
-    """
+    model_config = ConfigDict(extra="ignore")
 
-    model_config = ConfigDict(populate_by_name=True)
+    # The catalog row's primary key as a string (CustomerId / ProductId), or
+    # null for a match that came from no record.
+    id: str | None = None
+
+    value: str = ""
+
+    # A 0-1 fraction, not a percentage.
+    string_matching_score: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class ValueField(BaseModel, Generic[T]):
+    """A field read straight off the page, with nothing to match it against."""
+
+    model_config = ConfigDict(extra="ignore")
 
     value: T | None = None
-    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    ocr_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    bounding_box: BoundingBox | None = None
 
-    # Pre-normalization text, present only when normalization changed the value.
-    raw: str | None = None
 
-    # Canonical catalog entry this value was matched to. For a merchant this is
-    # always the customer's Name, even when the hit came through an alias.
-    matched_to: str | None = None
+class MatchedField(BaseModel):
+    """A field matched against one of the request's catalogs.
 
-    # Primary key of the matched catalog row (CustomerId / ProductId), so the
-    # desktop app can bind straight to the record instead of resolving the name
-    # a second time and possibly resolving it differently.
-    matched_id: int | None = None
+    Deliberately has no ``value``: ``original_value`` is what the paper said and
+    ``results`` is what the catalog offered, best first. Nothing here decides
+    between them.
+    """
 
-    # The specific name that scored the match.
-    matched_name: str | None = None
+    model_config = ConfigDict(extra="ignore")
 
-    match_score: float | None = Field(default=None, ge=0.0, le=1.0)
+    bounding_box: BoundingBox | None = None
+    ocr_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    original_value: str | None = None
+    results: list[MatchResultEntry] = Field(default_factory=list)
 
-    # Up to five ranked alternatives, best first. The app pre-selects
-    # candidates[0] in an editable combo box and offers the rest, so a
-    # near-miss costs one click rather than a re-typed line.
-    candidates: list[MatchCandidate] = Field(default_factory=list)
 
-    # True when the top candidate was too weak to accept unseen -- or when
-    # there was none. The verification screen highlights these.
-    requires_manual_review: bool = False
+class ProductRow(BaseModel):
+    """One line of the item table."""
 
-    # [x1, y1, x2, y2] in *preprocessed* image pixel space.
-    bbox: list[int] | None = None
+    model_config = ConfigDict(extra="ignore")
+
+    product_name: MatchedField = Field(default_factory=MatchedField)
+
+    # An integer by the normalization rules: a separator inside a handwritten
+    # quantity is a mis-read stroke, not a decimal point.
+    quantity: ValueField[int] = Field(default_factory=ValueField[int])
+    unit_price: ValueField[float] = Field(default_factory=ValueField[float])
+    total_price: ValueField[float] = Field(default_factory=ValueField[float])
 
 
 class ExtractionSource(BaseModel):
@@ -91,91 +106,26 @@ class ExtractionSource(BaseModel):
     height: int = 0
 
 
-class ExtractedHeader(BaseModel):
-    merchant_name: ExtractedField[str] = Field(default_factory=ExtractedField[str])
-    invoice_number: ExtractedField[str] = Field(default_factory=ExtractedField[str])
-    invoice_date: ExtractedField[str] = Field(default_factory=ExtractedField[str])
-    city: ExtractedField[str] = Field(default_factory=ExtractedField[str])
-    total_amount: ExtractedField[float] = Field(default_factory=ExtractedField[float])
-
-
-class ExtractedLineItem(BaseModel):
-    row_index: int = 0
-    product_name: ExtractedField[str] = Field(default_factory=ExtractedField[str])
-
-    # Quantity is an integer by the normalization rules: separators inside a
-    # handwritten quantity are mis-read strokes, not decimal points.
-    quantity: ExtractedField[int] = Field(default_factory=ExtractedField[int])
-    unit_price: ExtractedField[float] = Field(default_factory=ExtractedField[float])
-    total_price: ExtractedField[float] = Field(default_factory=ExtractedField[float])
-
-    # Advisory. The C# side re-validates independently and does not trust this.
-    arithmetic_ok: bool = True
-
-
-class OverlayElement(BaseModel):
-    """One box on the page, for the image overlay on the verification screen.
-
-    Everything the OCR engine found appears here, including text no invoice
-    field claimed, so the overlay can show the user what was read where.
-    """
-
-    model_config = ConfigDict(extra="ignore")
-
-    id: str
-    kind: str
-
-    # Which invoice field the layout stage decided this box holds
-    # ("invoice_number", "quantity", "total_amount", ...) and roughly where it
-    # sits ("header" / "table" / "footer"). Both are "unknown" when no layout
-    # classifier ran, so a client can tell "not classified" from "classified as
-    # nothing".
-    role: str = "unknown"
-    zone: str = "unknown"
-
-    bbox: list[int]
-    raw_text: str = ""
-    corrected_text: str = ""
-    confidence: float = 0.0
-    candidates: list[MatchCandidate] = Field(default_factory=list)
-    editable: bool = True
-
-    table_id: str | None = None
-    row: int | None = None
-    col: int | None = None
-
-    # A totals row with no vertical dividers drawn across it is one wide cell,
-    # not several narrow ones.
-    row_span: int = 1
-    col_span: int = 1
-
-
-class ExtractionWarning(BaseModel):
-    code: str
-    field: str | None = None
-    message: str
-
-
 class ExtractionResult(BaseModel):
-    request_id: str
+    """The whole 200 body. These keys and no others."""
+
     processing_ms: int = 0
     source: ExtractionSource = Field(default_factory=ExtractionSource)
-    header: ExtractedHeader = Field(default_factory=ExtractedHeader)
-    line_items: list[ExtractedLineItem] = Field(default_factory=list)
-    warnings: list[ExtractionWarning] = Field(default_factory=list)
-    raw_text: str = ""
 
-    # The pipeline's own id for this run, which is also the folder name under
-    # `results/`. Sending it back lets a support request name one run.
-    invoice_id: str | None = None
-    ocr_engine: str | None = None
+    # The invoice number printed on the paper. NOT the pipeline's own run id --
+    # that stays in the service log and under `results/`, and is not sent.
+    invoice_id: ValueField[str] = Field(default_factory=ValueField[str])
 
-    elements: list[OverlayElement] = Field(default_factory=list)
+    customer_name: MatchedField = Field(default_factory=MatchedField)
+    date: ValueField[str] = Field(default_factory=ValueField[str])
+    city: MatchedField = Field(default_factory=MatchedField)
+    products: list[ProductRow] = Field(default_factory=list)
+    total_invoice_price: ValueField[float] = Field(default_factory=ValueField[float])
 
     # Diagnostic images, base64 PNG, present only when
     # options.return_debug_images is set. Both are downscaled to
-    # settings.debug_image_max_width, so `bbox` coordinates -- which are in
-    # full preprocessed-image space -- do not map onto them 1:1.
+    # settings.debug_image_max_width, so the boxes above -- which are in full
+    # corrected-page space -- do not map onto them 1:1.
     enhanced_image_png: str | None = None
     ocr_input_image_png: str | None = None
 
@@ -299,12 +249,21 @@ class KnownCity(BaseModel):
 
 
 class ExtractionOptions(BaseModel):
-    """Options accompanying the upload. Every field has a usable default."""
+    """Options accompanying the upload. Every field has a usable default.
+
+    `languages` and `invoice_type` are gone. The pipeline is Arabic-primary and
+    every prompt, keyword list and normalization rule in it is written for
+    Arabic, so a language list was a knob that changed nothing; and whether an
+    invoice is a sale or a purchase is a property of the record the desktop app
+    files, not of the paper being read.
+
+    The pipeline configuration is no longer nested here either -- it is its own
+    `config` part of the multipart request. The two are sent by different parts
+    of the app for different reasons: options come from the current batch, the
+    configuration from the settings page.
+    """
 
     model_config = ConfigDict(extra="ignore")
-
-    languages: list[str] = Field(default_factory=lambda: ["ar", "en"])
-    invoice_type: Literal["Sale", "Purchase"] | None = None
 
     # Sent from the C# Customers/Products tables; empty disables matching for
     # that field and leaves the raw OCR text with an empty candidate list.
@@ -316,11 +275,6 @@ class ExtractionOptions(BaseModel):
     max_candidates: int = Field(default=5, ge=1, le=25)
 
     return_debug_images: bool = False
-
-    # The full pipeline configuration, per docs/settings-config-contract.md.
-    # Omitted means "use the service's own default config file", which is what
-    # the CLI and the tests rely on.
-    configuration: PipelineSettings | None = None
 
     # Bare name strings are still accepted for every catalog, so a client that
     # has only names -- or one written against the previous contract -- works.
@@ -356,17 +310,6 @@ class ErrorBody(BaseModel):
 
 class ErrorEnvelope(BaseModel):
     error: ErrorBody
-
-
-class WarningCodes:
-    LOW_CONFIDENCE_FIELD = "LOW_CONFIDENCE_FIELD"
-    ARITHMETIC_MISMATCH = "ARITHMETIC_MISMATCH"
-    TOTAL_MISMATCH = "TOTAL_MISMATCH"
-    NO_LINE_ITEMS = "NO_LINE_ITEMS"
-    SKEW_CORRECTED = "SKEW_CORRECTED"
-    DEBUG_IMAGE_UNAVAILABLE = "DEBUG_IMAGE_UNAVAILABLE"
-    MANUAL_REVIEW_REQUIRED = "MANUAL_REVIEW_REQUIRED"
-    NO_LAYOUT_DETECTED = "NO_LAYOUT_DETECTED"
 
 
 class ErrorCodes:
