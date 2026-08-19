@@ -452,3 +452,59 @@ class TestExtract:
         for key in ("invoice_id", "customer_name", "date", "city", "products",
                     "total_invoice_price"):
             assert first[key] == second[key], key
+
+
+class TestConcurrency:
+    """The extract endpoint must not run on the event loop.
+
+    `orchestrator.run` is entirely synchronous, CPU- and GPU-bound work that
+    takes one to three minutes on a handwritten invoice. Declared `async def`,
+    it blocked uvicorn's single event loop for that whole time: the desktop
+    app's concurrent `/health` probe went unanswered until the extraction
+    finished, its HttpClient hit its own timeout and reported a failure for an
+    invoice the service had in fact extracted perfectly, and every later file in
+    a batch queued behind the first with no thread to run on.
+
+    FastAPI routes a plain `def` endpoint to its thread pool instead, which is
+    what `PipelinePool`'s lock was written for.
+    """
+
+    def test_extract_is_not_a_coroutine_function(self):
+        # The exact predicate FastAPI uses to decide thread pool vs event loop.
+        import inspect
+
+        from api.routes import extract
+
+        assert not inspect.iscoroutinefunction(extract), (
+            "extract() must stay a plain `def`. As `async def` it runs the "
+            "blocking pipeline directly on the event loop and starves every "
+            "other request for the length of an extraction."
+        )
+
+    def test_the_service_still_answers_while_an_extraction_runs(
+        self, client, invoice_png
+    ):
+        """A health probe lands while an extract is in flight.
+
+        The desktop app polls /health throughout a batch. Under the old
+        `async def` this response could not be produced until the extraction
+        released the loop.
+        """
+        import threading
+
+        health_status: list[int] = []
+        extraction_started = threading.Event()
+
+        def probe():
+            extraction_started.wait(timeout=10)
+            health_status.append(client.get("/api/v1/health").status_code)
+
+        prober = threading.Thread(target=probe)
+        prober.start()
+        extraction_started.set()
+
+        response = extract_with_stub(client, invoice_png)
+        prober.join(timeout=30)
+
+        assert response.status_code == 200
+        assert health_status == [200]

@@ -83,7 +83,7 @@ def default_configuration(request: Request) -> JSONResponse:
 
 
 @router.post("/extract")
-async def extract(
+def extract(
     request: Request,
     file: UploadFile = File(...),
     options: str | None = Form(default=None),
@@ -96,6 +96,18 @@ async def extract(
     the catalogs of the batch being processed, the configuration is what the
     settings page saved. Omitting `config` runs the service's own defaults,
     which is what the CLI and a fresh installation do.
+
+    Deliberately a plain ``def``, not ``async def``. ``orchestrator.run`` below
+    is entirely synchronous, CPU- and GPU-bound work that takes one to three
+    minutes on a handwritten invoice. Declared ``async``, that ran directly on
+    uvicorn's single event loop and blocked it for the whole extraction: the
+    desktop app's concurrent ``/health`` probe could not be answered, its
+    HttpClient hit its own timeout and reported a failure for an invoice the
+    service went on to extract perfectly -- and every later file in a batch
+    queued behind the first with no thread to run on. FastAPI runs a plain
+    ``def`` endpoint on its thread pool instead, which is what ``PipelinePool``
+    was built for; its lock exists precisely because two requests can then
+    genuinely arrive at once.
     """
     started = time.perf_counter()
     settings = get_settings()
@@ -141,7 +153,9 @@ async def extract(
             f"Supported: {', '.join(sorted(SUPPORTED_EXTENSIONS))}",
         )
 
-    data = await file.read()
+    # Sync read: this handler runs on the thread pool, so there is no loop to
+    # await on. UploadFile's underlying SpooledTemporaryFile is a plain file.
+    data = file.file.read()
 
     if not data:
         return error_response(400, ErrorCodes.EMPTY_FILE, "The uploaded file was empty.")
