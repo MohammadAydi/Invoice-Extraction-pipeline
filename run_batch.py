@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument("bills_dir", nargs="?", default="bills/onlyone",
                    help="folder to scan recursively for invoice images")
     p.add_argument("--config", dest="config_path",
-                   default="config/qwen_config.yaml")
+                   default="config/qwen_detector_config.yaml")
     return p.parse_args()
 
 
